@@ -19,6 +19,9 @@ from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
 from qwen_exo_booster.knowledge import (
     KnowledgeCandidate,
     KnowledgeRepository,
+    is_compatible_reflection_memory,
+    reflection_memory_matches_task,
+    reflection_task_category,
     semantic_document_group,
 )
 from qwen_exo_booster.policy_data import PolicyDataAttachment, PolicyDataRepository
@@ -479,6 +482,42 @@ class MemoryPipeline:
                 pass
         return (candidate.lane, document_group)
 
+    def _filter_task_scoped_reflections(
+        self,
+        candidates: tuple[KnowledgeCandidate, ...],
+        original_task: str,
+    ) -> tuple[tuple[KnowledgeCandidate, ...], int]:
+        kept = []
+        filtered = 0
+        for candidate in candidates:
+            if candidate.lane != "knowledge":
+                kept.append(candidate)
+                continue
+            try:
+                document = self.repository.get(candidate.document_id)
+            except KeyError:
+                kept.append(candidate)
+                continue
+            if reflection_memory_matches_task(document, original_task):
+                kept.append(candidate)
+            else:
+                filtered += 1
+        return tuple(kept), filtered
+
+    def _exact_task_reflection_candidates(
+        self, original_task: str, query: str
+    ) -> tuple[KnowledgeCandidate, ...]:
+        category = reflection_task_category(original_task)
+        return tuple(
+            replace(
+                self.repository.candidate_for_document(document.document_id, query),
+                candidate_origin="task_scope_exact",
+            )
+            for document in self.repository.snapshot.documents
+            if is_compatible_reflection_memory(document)
+            and document.retrieval_category == category
+        )
+
     def _merge_same_document_candidates(
         self, candidates: tuple[KnowledgeCandidate, ...]
     ) -> tuple[tuple[KnowledgeCandidate, ...], int]:
@@ -815,6 +854,7 @@ class MemoryPipeline:
         *,
         restoration: Any = None,
         retrieval_question: str | None = None,
+        original_task: str | None = None,
         query_heads: tuple[tuple[tuple[float, ...], ...], ...] = (),
         query_states: tuple[QueryStateSpan, ...] = (),
         query_role_plan_digest: str = "",
@@ -836,6 +876,7 @@ class MemoryPipeline:
             if retrieval_question is not None
             else self._request_question(request.input)
         ).strip()
+        task_scope = str(original_task or self._first_user_text(request.input)).strip()
         question_digest = stable_digest(question)
         retrieval_question_digest = stable_digest(question)
         retrieval_started = time.perf_counter()
@@ -881,6 +922,10 @@ class MemoryPipeline:
             qk_rank_audit = dict(qk_meta["rank_audit"])
             qk_rank_cache_hit = bool(qk_meta["cache_hit"])
 
+        exact_task_candidates = self._exact_task_reflection_candidates(
+            task_scope, question
+        )
+        candidates.extend(exact_task_candidates)
         previous = (
             await self.get_state(effective_memory_previous_response_id)
             if effective_memory_previous_response_id
@@ -978,6 +1023,10 @@ class MemoryPipeline:
                 or candidate.candidate_origin == "attention_q_native_tensor_bank"
             )
         )
+        task_scope_exact_candidate_count = len(exact_task_candidates)
+        candidate_tuple, task_scope_filtered_count = (
+            self._filter_task_scoped_reflections(candidate_tuple, task_scope)
+        )
         if self.telemetry is not None:
             self.telemetry.emit(
                 request.request_id,
@@ -993,6 +1042,9 @@ class MemoryPipeline:
                     "margin": qk_margin,
                     "rank_audit": dict(qk_rank_audit),
                     "cache_hit": qk_rank_cache_hit,
+                    "task_scope_category": reflection_task_category(task_scope),
+                    "task_scope_filtered_count": task_scope_filtered_count,
+                    "task_scope_exact_candidate_count": task_scope_exact_candidate_count,
                 },
             )
         (

@@ -175,6 +175,24 @@ def test_reflection_memory_accepts_structurally_valid_short_output():
     assert parsed["reflection"] == "现象已确认。"
 
 
+def test_reflection_memory_infers_unnamed_tool_from_complete_fields():
+    unnamed = _tool_call(REFLECTION_MEMORY_TOOL_NAME, _short_fields()).replace(
+        f' name="{REFLECTION_MEMORY_TOOL_NAME}"', ""
+    )
+
+    parsed = ReflectionMemoryService.parse_tool_call(unnamed)
+
+    assert parsed is not None
+    assert parsed["title"] == "简短反思"
+
+
+def test_reflection_memory_rejects_ambiguous_unnamed_tool():
+    with pytest.raises(ValueError, match="unexpected tool: <missing>"):
+        ReflectionMemoryService.parse_tool_call(
+            "<tool_call><title>不完整反思</title></tool_call>"
+        )
+
+
 def test_reflection_memory_accepts_concrete_bare_check_rule():
     fields = _fields()
     fields["reusable_experience"] = "检查 WebSocket 握手状态后再决定是否重试。"
@@ -271,6 +289,10 @@ def test_reflection_memory_uses_renamed_tool_and_knowledge_metadata():
     assert 'retrieval_category: "reflection-task-auto-toc-deadbeef"' in markdown
     assert '"reflection-memory"' in markdown
     assert "WFP_LAYER_ALE_AUTH_CONNECT_V4" in markdown
+    assert "reflection_memory_schema: 3" in markdown
+    assert "可执行规则（先读）:" in markdown
+    assert "停止信号与禁忌:" in markdown
+    assert len(record.compact_content) < 6000
     with pytest.raises(ValueError, match="unexpected tool"):
         ReflectionMemoryService.parse_tool_call(
             _tool_call("save_trajectory_reflection", fields)
@@ -350,6 +372,7 @@ def test_reflection_prompt_contains_full_structured_trajectory_and_title_contrac
     assert "哪一条观察本应触发停止或转向" in prompt
     assert "批判决策质量和信息增益" in prompt
     assert "<memory_action>insert|update</memory_action>" in prompt
+    assert "模型自写的 smoke、局部测试或完成声明不足以证明成功" in prompt
     assert audit["provided_history_rows"] == 5
     assert audit["retained_history_rows"] == 5
     assert audit["source_tokens"] <= 8192

@@ -551,6 +551,7 @@ async def test_reflection_template_tokens_are_not_searchable_but_native_state_is
     root.mkdir()
     (root / "reflection.md").write_text(
         "---\nsource_kind: trajectory_reflection\n"
+        "reflection_memory_schema: 3\n"
         "document_group: reflection_memory\n---\n"
         "# WFP remote assistance\n\n"
         "**结果：** 成功\n\n"
@@ -610,6 +611,7 @@ async def test_tensor_bank_bounds_source_families_without_hiding_reflections(
     root.mkdir()
     reflection_header = (
         "---\nsource_kind: trajectory_reflection\n"
+        "reflection_memory_schema: 3\n"
         "document_group: reflection_memory\n---\n"
     )
     for suffix in ("a", "b", "c", "d"):

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from qwen_exo_booster.tags import TagValidationError, normalize_tags
+from qwen_exo_booster.contracts import stable_digest
 
 _MARKDOWN_SUFFIXES = frozenset({".md", ".markdown"})
 _TERM_PATTERN = re.compile(r"[\w]+", re.UNICODE)
@@ -56,6 +57,7 @@ def markdown_metadata(text: str) -> dict[str, object]:
     source_kind = str(raw.get("source_kind", "unclassified")).strip()
     document_group = str(raw.get("document_group", "")).strip() or None
     retrieval_category = str(raw.get("retrieval_category", "")).strip() or None
+    reflection_memory_schema = raw.get("reflection_memory_schema")
     title = str(raw.get("title", "")).strip()
     if not title:
         body = text[match.end() :] if match else text
@@ -71,6 +73,7 @@ def markdown_metadata(text: str) -> dict[str, object]:
         "source_kind": source_kind or "unclassified",
         "document_group": document_group,
         "retrieval_category": retrieval_category,
+        "reflection_memory_schema": reflection_memory_schema,
         "title": title or None,
         "tags": tags,
     }
@@ -211,6 +214,48 @@ def retrieval_diversity_bucket(document: KnowledgeDocument) -> str:
         return category
     source_kind = str(document.source_kind or "unclassified").strip()
     return source_kind or "unclassified"
+
+
+def is_reflection_memory_document(document: KnowledgeDocument) -> bool:
+    return bool(
+        document.source_kind == "trajectory_reflection"
+        or document.document_group == "reflection_memory"
+        or "reflection-memory" in document.tags
+    )
+
+
+def reflection_task_category(original_task: str) -> str:
+    normalized = " ".join(str(original_task).split()).casefold()
+    digest = stable_digest("reflection-memory-task-category-v1", normalized)[:16]
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-")
+    for prefix in ("please-solve-this-issue-", "solve-this-issue-"):
+        if slug.startswith(prefix):
+            slug = slug[len(prefix) :]
+            break
+    slug = slug[:64].rstrip("-")
+    return f"reflection-task-{slug + '-' if slug else ''}{digest}"
+
+
+def reflection_memory_matches_task(
+    document: KnowledgeDocument, original_task: str
+) -> bool:
+    if not is_reflection_memory_document(document):
+        return True
+    category = str(document.retrieval_category or "").strip()
+    if not category.startswith("reflection-task-"):
+        return True
+    return category == reflection_task_category(original_task)
+
+
+def is_compatible_reflection_memory(document: KnowledgeDocument) -> bool:
+    """Accept only bounded, schema-versioned reflection rule cards."""
+    if not is_reflection_memory_document(document):
+        return False
+    value = markdown_metadata(document.content).get("reflection_memory_schema")
+    try:
+        return int(float(value)) == 3
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass(frozen=True, slots=True)

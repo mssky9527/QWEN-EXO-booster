@@ -7,9 +7,12 @@ import pytest
 from qwen_exo_booster.document_categories import DocumentCategoryStore
 from qwen_exo_booster.knowledge import (
     KnowledgeRepository,
+    is_compatible_reflection_memory,
     lexical_terms,
     markdown_metadata,
     normalize_markdown,
+    reflection_memory_matches_task,
+    reflection_task_category,
     set_markdown_retrieval_category,
 )
 from qwen_exo_booster.document_ingest import (
@@ -41,6 +44,7 @@ WFP_ALE_AUTH_CONNECT   permits identifiers.
         "source_kind": "local_verified",
         "document_group": None,
         "retrieval_category": None,
+        "reflection_memory_schema": None,
         "tags": (),
         "title": "Title",
     }
@@ -60,6 +64,49 @@ def test_retrieval_category_update_preserves_existing_front_matter():
     assert markdown_metadata(updated)["retrieval_category"] == "windows-networking"
     assert markdown_metadata(updated)["source_kind"] == "local_sdk_verified"
     assert updated.count("retrieval_category:") == 1
+
+
+def test_reflection_memory_schema_gate_rejects_legacy_documents(tmp_path):
+    repository = KnowledgeRepository(tmp_path)
+    legacy = repository.upsert(
+        "reflection-memory/legacy.md",
+        "---\nsource_kind: trajectory_reflection\ndocument_group: reflection_memory\n"
+        "tags: [reflection-memory]\n---\n\n# Legacy\nLong legacy reflection.",
+    )
+    current = repository.upsert(
+        "reflection-memory/current.md",
+        "---\nsource_kind: trajectory_reflection\ndocument_group: reflection_memory\n"
+        "reflection_memory_schema: 3\ntags: [reflection-memory]\n---\n\n"
+        "# Current\n可执行规则：先观察证据。",
+    )
+
+    assert is_compatible_reflection_memory(legacy) is False
+    assert is_compatible_reflection_memory(current) is True
+
+
+def test_task_scoped_reflection_matches_only_its_original_task(tmp_path):
+    task = "Please solve this issue: add implicit HEAD and OPTIONS routing"
+    category = reflection_task_category(task)
+    repository = KnowledgeRepository(tmp_path)
+    scoped = repository.upsert(
+        "reflection-memory/scoped.md",
+        "---\nsource_kind: trajectory_reflection\n"
+        "document_group: reflection_memory\nreflection_memory_schema: 3\n"
+        f"retrieval_category: {category}\n---\n\n# Scoped\nRule.",
+    )
+    shared = repository.upsert(
+        "reflection-memory/shared.md",
+        "---\nsource_kind: trajectory_reflection\n"
+        "document_group: reflection_memory\nreflection_memory_schema: 3\n"
+        "retrieval_category: shared-reflection\n---\n\n# Shared\nRule.",
+    )
+
+    assert reflection_memory_matches_task(scoped, task) is True
+    assert (
+        reflection_memory_matches_task(scoped, "Fix deprecated response headers")
+        is False
+    )
+    assert reflection_memory_matches_task(shared, "Any unrelated task") is True
 
 
 def test_repository_upsert_refresh_and_delete(tmp_path):
@@ -648,6 +695,7 @@ async def test_runtime_reflection_qk_search_is_scoped_to_reflection_documents(tm
         "reflection-memory/network.md",
         """---
 source_kind: trajectory_reflection
+reflection_memory_schema: 3
 document_group: reflection_memory
 title: Network probe
 tags: [reflection-memory]
@@ -706,6 +754,7 @@ async def test_runtime_reflection_organizer_builds_model_reviews_from_high_qk_pa
             f"reflection-memory/{name}.md",
             f"""---
 source_kind: trajectory_reflection
+reflection_memory_schema: 3
 document_group: reflection_memory
 title: {title}
 tags: [reflection-memory]

@@ -9,7 +9,11 @@ from qwen_exo_booster.contracts import (
     EligibilityStatus,
     stable_digest,
 )
-from qwen_exo_booster.knowledge import KnowledgeRepository, NativePrefixSelection
+from qwen_exo_booster.knowledge import (
+    KnowledgeRepository,
+    NativePrefixSelection,
+    reflection_task_category,
+)
 from qwen_exo_booster.pipeline import MemoryPipeline, response_memory_metadata
 from qwen_exo_booster.policy_data import PolicyDataRepository
 from qwen_exo_booster.query_probe import QueryStateSpan
@@ -989,6 +993,57 @@ def test_reflection_collection_label_does_not_merge_distinct_memories(tmp_path):
     assert prefilter["merged_count"] == 0
     assert prefilter["sent_to_judge"] == 2
     assert state.selected_document_ids == (first.document_id,)
+
+
+def test_request_start_filters_reflection_from_another_task(tmp_path):
+    repo = KnowledgeRepository(tmp_path / "reflection-scope")
+    target_task = "Please solve this issue: add implicit HEAD and OPTIONS routing"
+    other_task = "Please solve this issue: add deprecated response headers"
+
+    def reflection(path, task, body):
+        repo.upsert(
+            path,
+            "---\nsource_kind: trajectory_reflection\n"
+            "document_group: reflection_memory\nreflection_memory_schema: 3\n"
+            f"retrieval_category: {reflection_task_category(task)}\n---\n\n{body}",
+        )
+
+    reflection("reflection-memory/target.md", target_task, "Implicit method rules.")
+    reflection("reflection-memory/other.md", other_task, "Deprecation header rules.")
+    other = native_candidate(repo, "reflection-memory/other.md", page_id=3, score=0.99)
+    bank = FakeQKTensorBank((other,))
+    telemetry = FakeTelemetry()
+    judge = FakeReferenceJudge(supported=True)
+    pipeline = build_pipeline(
+        config(tmp_path, policy_data=False),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=bank,
+        reference_judge=judge,
+        telemetry=telemetry,
+    )
+
+    _prepared, state = asyncio.run(
+        pipeline.prepare_responses_request(
+            FakeRequest(request_id="resp-task-scope", input="Continue"),
+            original_task=target_task,
+            retrieval_question=f"ORIGINAL TASK:\n{target_task}\n\nContinue",
+            query_heads=(((1.0, 0.0),),),
+            query_states=query_states((((1.0, 0.0),),)),
+            query_probe_status="ready",
+        )
+    )
+
+    assert [candidate.relative_path for candidate in judge.calls[0][2]] == [
+        "reflection-memory/target.md"
+    ]
+    assert judge.calls[0][2][0].candidate_origin == "task_scope_exact"
+    assert state.decisions[0].status is EligibilityStatus.ELIGIBLE
+    assert state.selected_document_ids == ()
+    (proposed,) = telemetry.by_type("tensor.candidates_proposed")
+    assert proposed["task_scope_filtered_count"] == 1
+    assert proposed["task_scope_exact_candidate_count"] == 1
+    assert proposed["task_scope_category"] == reflection_task_category(target_task)
 
 
 def test_comparative_selector_can_choose_lower_qk_candidate(tmp_path):

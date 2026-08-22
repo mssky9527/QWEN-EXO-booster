@@ -17,7 +17,13 @@ from qwen_exo_booster.contracts import (
 )
 from qwen_exo_booster.internal_jobs import InternalJobResult, InternalJobRunner
 from qwen_exo_booster.judge import ReferenceJudge
-from qwen_exo_booster.knowledge import KnowledgeCandidate, KnowledgeRepository
+from qwen_exo_booster.knowledge import (
+    KnowledgeCandidate,
+    KnowledgeRepository,
+    is_compatible_reflection_memory,
+    reflection_memory_matches_task,
+    reflection_task_category,
+)
 from qwen_exo_booster.observer import MidThinkEvent
 from qwen_exo_booster.policy_data import PolicyDataRepository
 from qwen_exo_booster.query_probe import QueryProbePlan
@@ -364,6 +370,42 @@ class SelfAskRefreshService:
         self._self_ask_cache: OrderedDict[str, _SelfQuestion | None] = OrderedDict()
         self._self_ask_cache_lock = asyncio.Lock()
 
+    def _filter_task_scoped_reflections(
+        self,
+        candidates: tuple[KnowledgeCandidate, ...],
+        original_task: str,
+    ) -> tuple[tuple[KnowledgeCandidate, ...], int]:
+        kept = []
+        filtered = 0
+        for candidate in candidates:
+            if candidate.lane != "knowledge":
+                kept.append(candidate)
+                continue
+            try:
+                document = self.repository.get(candidate.document_id)
+            except KeyError:
+                kept.append(candidate)
+                continue
+            if reflection_memory_matches_task(document, original_task):
+                kept.append(candidate)
+            else:
+                filtered += 1
+        return tuple(kept), filtered
+
+    def _exact_task_reflection_candidates(
+        self, original_task: str, query: str
+    ) -> tuple[KnowledgeCandidate, ...]:
+        category = reflection_task_category(original_task)
+        return tuple(
+            replace(
+                self.repository.candidate_for_document(document.document_id, query),
+                candidate_origin="task_scope_exact",
+            )
+            for document in self.repository.snapshot.documents
+            if is_compatible_reflection_memory(document)
+            and document.retrieval_category == category
+        )
+
     async def refresh(
         self,
         *,
@@ -533,6 +575,23 @@ class SelfAskRefreshService:
                         for candidate in raw_proposed
                         if not self.policy_data.is_non_reference_candidate(candidate)
                     )
+                known_documents = {
+                    (candidate.lane, candidate.document_id)
+                    for candidate in raw_proposed
+                }
+                exact_task_candidates = tuple(
+                    candidate
+                    for candidate in self._exact_task_reflection_candidates(
+                        user_question, self_question
+                    )
+                    if (candidate.lane, candidate.document_id) not in known_documents
+                )
+                raw_proposed = (*raw_proposed, *exact_task_candidates)
+                raw_proposed, task_scope_filtered_count = (
+                    self._filter_task_scoped_reflections(
+                        tuple(raw_proposed), user_question
+                    )
+                )
                 deduplicated: list[KnowledgeCandidate] = []
                 seen_candidates: set[tuple[str, str]] = set()
                 for candidate in raw_proposed:
@@ -685,6 +744,9 @@ class SelfAskRefreshService:
                         "bypassed_lanes": [
                             *(["policydata"] if direct_candidates else []),
                         ],
+                        "task_scope_category": reflection_task_category(user_question),
+                        "task_scope_filtered_count": task_scope_filtered_count,
+                        "task_scope_exact_candidate_count": len(exact_task_candidates),
                     },
                 )
                 self.telemetry.emit(

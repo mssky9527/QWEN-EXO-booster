@@ -35,7 +35,10 @@ from qwen_exo_booster.config import PROJECT_NAME, QwenExoConfig, qk_recall_gates
 from qwen_exo_booster.cognition import CognitionRepository
 from qwen_exo_booster.document_categories import DocumentCategoryStore
 from qwen_exo_booster.contracts import stable_digest
-from qwen_exo_booster.knowledge import set_markdown_retrieval_category
+from qwen_exo_booster.knowledge import (
+    is_compatible_reflection_memory,
+    set_markdown_retrieval_category,
+)
 from qwen_exo_booster.document_ingest import (
     KnowledgeIngestError,
     is_supported_knowledge_filename,
@@ -71,6 +74,7 @@ from qwen_exo_booster.pipeline import MemoryPipeline, MemoryPreparationState
 from qwen_exo_booster.policy_data import PolicyDataRepository
 from qwen_exo_booster.recall_trace import recall_trace_payload
 from qwen_exo_booster.reflection_memory import (
+    REFLECTION_MEMORY_SCHEMA,
     ReflectionMemory,
     ReflectionMemoryCandidate,
     ReflectionMemoryService,
@@ -1218,6 +1222,7 @@ class QwenExoRuntime:
             request,
             restoration=restoration,
             retrieval_question=retrieval_question,
+            original_task=original_task or None,
             query_heads=query_heads,
             query_states=query_states,
             query_role_plan_digest=query_role_plan_digest,
@@ -5286,11 +5291,7 @@ class QwenExoRuntime:
         documents = tuple(
             document
             for document in self.knowledge.snapshot.documents
-            if (
-                document.source_kind == "trajectory_reflection"
-                or document.document_group == "reflection_memory"
-                or "reflection-memory" in document.tags
-            )
+            if is_compatible_reflection_memory(document)
         )
         self.telemetry.emit(
             parent_id,
@@ -5625,11 +5626,7 @@ class QwenExoRuntime:
             documents = tuple(
                 document
                 for document in self.knowledge.snapshot.documents
-                if (
-                    document.source_kind == "trajectory_reflection"
-                    or document.document_group == "reflection_memory"
-                    or "reflection-memory" in document.tags
-                )
+                if is_compatible_reflection_memory(document)
             )
             if progress is not None:
                 progress(
@@ -5897,14 +5894,9 @@ class QwenExoRuntime:
                 payload = {
                     "status": "merged",
                     "document_count_before": len(documents),
-                    "document_count_after": len(
-                        [
-                            document
-                            for document in self.knowledge.snapshot.documents
-                            if document.source_kind == "trajectory_reflection"
-                            or document.document_group == "reflection_memory"
-                            or "reflection-memory" in document.tags
-                        ]
+                    "document_count_after": sum(
+                        is_compatible_reflection_memory(document)
+                        for document in self.knowledge.snapshot.documents
                     ),
                     "high_qk_pair_count": len(ranked_pairs),
                     "review_count": review_count,
@@ -5999,6 +5991,10 @@ class QwenExoRuntime:
                     markdown,
                     tags=["reflection-memory", f"outcome-{reflection.outcome}"],
                 )
+                if not is_compatible_reflection_memory(document):
+                    raise RuntimeError(
+                        "Published reflection memory schema is incompatible"
+                    )
                 for merged_path in previous_documents:
                     if merged_path != relative_path:
                         self.knowledge.delete(merged_path)
@@ -6071,6 +6067,9 @@ class QwenExoRuntime:
             "hot_updated": True,
             "restart_required": False,
             "publication_status": "published",
+            "reflection_memory_schema": REFLECTION_MEMORY_SCHEMA,
+            "compact_card_characters": len(reflection.compact_content),
+            "compact_card_digest": stable_digest(reflection.compact_content),
             "document_count": len(self.knowledge.snapshot.documents),
         }
         self.telemetry.emit("admin", "reflection_memory.published", payload)

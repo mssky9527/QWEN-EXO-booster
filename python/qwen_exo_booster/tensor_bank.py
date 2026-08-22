@@ -27,6 +27,8 @@ from qwen_exo_booster.knowledge import (
     KnowledgeCandidate,
     NativePrefixSelection,
     QueryQKAttribution,
+    is_compatible_reflection_memory,
+    is_reflection_memory_document,
     retrieval_diversity_bucket,
     semantic_document_group,
 )
@@ -77,6 +79,16 @@ _REFLECTION_TEMPLATE_MARKERS = (
     "因果分析与不确定性:",
     "冲突整理与保留边界:",
     "可复用经验与适用边界:",
+    "memory_schema:",
+    "scope:",
+    "outcome:",
+    "核心观察与结论:",
+    "决定性证据:",
+    "因果与反证边界:",
+    "可执行规则（先读）:",
+    "停止信号与禁忌:",
+    "下一步检查:",
+    "冲突与适用边界:",
     "应避免的做法:",
     "下一次建议:",
 )
@@ -539,6 +551,12 @@ class TensorBank:
                         "Tensor Bank compiler qualifier encoded no tokens"
                     )
                 for document in repository.snapshot.documents:
+                    if (
+                        lane == "knowledge"
+                        and is_reflection_memory_document(document)
+                        and not is_compatible_reflection_memory(document)
+                    ):
+                        continue
                     if (
                         selected_documents is not None
                         and lane not in {"cognition", "policydata"}

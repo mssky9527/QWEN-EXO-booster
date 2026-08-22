@@ -18,12 +18,29 @@ from qwen_exo_booster.contracts import (
     stable_digest,
 )
 from qwen_exo_booster.internal_jobs import InternalJobResult, InternalJobRunner
+from qwen_exo_booster.knowledge import reflection_task_category
 from qwen_exo_booster.telemetry import TelemetryStore
 
 REFLECTION_MEMORY_TOOL_NAME = "save_reflection_memory"
 REFLECTION_MEMORY_SKIP_TOOL_NAME = "skip_reflection_memory"
 REFLECTION_MEMORY_OUTCOMES = frozenset({"success", "failure", "mixed", "uncertain"})
 REFLECTION_MEMORY_ACTIONS = frozenset({"insert", "update"})
+
+REFLECTION_MEMORY_SCHEMA = 3
+
+
+def _compact_memory_text(value: object, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    marker = " … "
+    if limit <= len(marker) + 2:
+        return text[:limit]
+    head = max(1, (limit - len(marker)) * 2 // 3)
+    tail = max(1, limit - len(marker) - head)
+    return text[:head] + marker + text[-tail:]
+
+
 REFLECTION_MEMORY_MAX_ATTEMPTS = 3
 _REFLECTION_MEMORY_TOOL_PATTERN = re.compile(
     r"<tool_call(?:\s+name=[\"'](?P<name>[^\"']+)[\"'])?\s*>"
@@ -58,15 +75,7 @@ _REFLECTION_MEMORY_OUTCOME_LABELS = {
 
 
 def _reflection_task_category(original_task: str) -> str:
-    normalized = " ".join(str(original_task).split()).casefold()
-    digest = stable_digest("reflection-memory-task-category-v1", normalized)[:16]
-    slug = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-")
-    for prefix in ("please-solve-this-issue-", "solve-this-issue-"):
-        if slug.startswith(prefix):
-            slug = slug[len(prefix) :]
-            break
-    slug = slug[:64].rstrip("-")
-    return f"reflection-task-{slug + '-' if slug else ''}{digest}"
+    return reflection_task_category(original_task)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +141,32 @@ class ReflectionMemory:
             )
         )
 
+    @property
+    def compact_content(self) -> str:
+        """Return the bounded rule card indexed by the public memory bank."""
+        category = self.retrieval_category or "shared-reflection"
+        return "\n".join(
+            (
+                f"memory_schema: {REFLECTION_MEMORY_SCHEMA}",
+                f"scope: {category}",
+                f"outcome: {_REFLECTION_MEMORY_OUTCOME_LABELS[self.outcome]}",
+                "可执行规则（先读）:",
+                _compact_memory_text(self.reusable_experience, 1200),
+                "停止信号与禁忌:",
+                _compact_memory_text(self.avoid, 800),
+                "下一步检查:",
+                _compact_memory_text(self.next_time, 1000),
+                "核心观察与结论:",
+                _compact_memory_text(self.reflection, 500),
+                "决定性证据:",
+                _compact_memory_text(self.evidence, 650),
+                "因果与反证边界:",
+                _compact_memory_text(self.causal_analysis, 650),
+                "冲突与适用边界:",
+                _compact_memory_text(self.conflict_resolution, 650),
+            )
+        )
+
     def markdown(self) -> str:
         tags = ["reflection-memory", f"outcome-{self.outcome}"]
         retrieval_category = (
@@ -146,12 +181,11 @@ class ReflectionMemory:
             "quality: 0.7\n"
             "source_kind: trajectory_reflection\n"
             "document_group: reflection_memory\n"
+            f"reflection_memory_schema: {REFLECTION_MEMORY_SCHEMA}\n"
             f"{retrieval_category}"
             f"tags: {json.dumps(tags, ensure_ascii=False)}\n"
             "---\n\n"
-            f"# {self.title}\n\n"
-            f"**结果：** {_REFLECTION_MEMORY_OUTCOME_LABELS[self.outcome]}\n\n"
-            f"{self.content}\n"
+            f"{self.compact_content}\n"
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -169,6 +203,8 @@ class ReflectionMemory:
             "avoid": self.avoid,
             "next_time": self.next_time,
             "retrieval_category": self.retrieval_category,
+            "reflection_memory_schema": REFLECTION_MEMORY_SCHEMA,
+            "compact_content": self.compact_content,
             "memory_action": self.memory_action,
             "target_document_path": self.target_document_path,
             "target_document_sha256": self.target_document_sha256,
@@ -794,6 +830,8 @@ class ReflectionMemoryService:
             "除非重复证据证明稳定缺陷；禁止形成永久禁用某工具的通用规则。每条经验必须限定版本、输入、"
             "权限和环境。除非轨迹直接证明因果关系，不得建议 regex、字符串转换、额外空格、重试或"
             "绕开工具。禁止输出“认真仔细”“检查语法”“确保准确”等空泛建议。"
+            "每条记忆还必须先给出一条短的可执行规则：第一句写触发条件，第二句写动作或停止信号；"
+            "不要把关键规则埋在过程叙述末尾。"
             "已有反思候选由模型原生 Q×K 检索提出，它们只是不可信的比较材料，不是相似性证明。"
             "必须比较底层问题、因果机制、决策点和可复用决策规则；主题、措辞、工具或标识符相同都"
             "不足以合并。若一个或多个候选表达同一经验，设置 memory_action=update，复制一个精确"
@@ -801,6 +839,9 @@ class ReflectionMemoryService:
             " merge_document_paths。输出一份完整替代记忆，保留仍被证明的证据，整合新观测，并在"
             " conflict_resolution 中逐项整理矛盾。仅主题相似的候选不得合并。若所有候选实质不同，"
             "设置 memory_action=insert、target_document_path=none、merge_document_paths=[]。"
+            "只有轨迹包含覆盖任务验收条件的权威验证结果时，outcome 才能是 success；模型自写的 smoke、"
+            "局部测试或完成声明不足以证明成功。缺少外部验收或全量套件证据时必须使用 mixed 或 uncertain，"
+            "并在 evidence 中明确未验证边界。"
             "禁止更新或合并未出现在候选中的路径。若轨迹没有具体、可复用的新经验，调用"
             " skip_reflection_memory；否则只调用一次 save_reflection_memory。"
             "标题必须由模型生成简洁的中文标题和管理标签，不得使用文件名、哈希、请求 ID 或照抄任务。"
@@ -1235,7 +1276,9 @@ class ReflectionMemoryService:
                 )
             return None
         if name != REFLECTION_MEMORY_TOOL_NAME:
-            raise ValueError(f"Reflection memory called unexpected tool: {name}")
+            raise ValueError(
+                "Reflection memory called unexpected tool: " + (name or "<missing>")
+            )
         values: dict[str, Any] = {}
         for match in _REFLECTION_MEMORY_FIELD_PATTERN.finditer(body):
             field = match.group("field").lower()
@@ -1326,6 +1369,28 @@ class ReflectionMemoryService:
                     re.IGNORECASE,
                 )
                 name = name_match.group(1).strip() if name_match else ""
+            if not name:
+                field_names = {
+                    field.group("field").lower()
+                    for field in _REFLECTION_MEMORY_FIELD_PATTERN.finditer(body)
+                }
+                if field_names == {"reason"}:
+                    name = REFLECTION_MEMORY_SKIP_TOOL_NAME
+                elif {
+                    "title",
+                    "outcome",
+                    "memory_action",
+                    "target_document_path",
+                    "merge_document_paths",
+                    "reflection",
+                    "evidence",
+                    "causal_analysis",
+                    "conflict_resolution",
+                    "reusable_experience",
+                    "avoid",
+                    "next_time",
+                }.issubset(field_names):
+                    name = REFLECTION_MEMORY_TOOL_NAME
             yield name, body
 
     @staticmethod
