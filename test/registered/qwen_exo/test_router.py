@@ -73,7 +73,7 @@ class FakeRuntime:
     def __init__(self):
         self.config = SimpleNamespace(
             telemetry_text_mode="off",
-            feature_flags=SimpleNamespace(policy_data=True),
+            feature_flags=SimpleNamespace(policy_data=True, activation_training=True),
             max_policy_tokens=4096,
         )
         self.state = QwenExoRuntimeState.READY
@@ -103,6 +103,22 @@ class FakeRuntime:
                 "trajectory_id": "resp-1",
                 "status": "waiting",
             }
+        }
+        self.reflections = {
+            "source-1": {
+                "source_digest": "source-1",
+                "trajectory_id": "resp-1",
+                "document_path": "reflection-memory/source-1.md",
+                "document_sha256": "a" * 64,
+                "source_available": True,
+            }
+        }
+        self._reflection_regeneration_status = {
+            "job_id": None,
+            "status": "idle",
+            "stage": "idle",
+            "progress": 0,
+            "message": "尚未开始重新反思",
         }
 
     def status(self):
@@ -168,6 +184,47 @@ class FakeRuntime:
 
     def reflection_memory_organization_status(self):
         return dict(self._reflection_organization_status)
+
+    def reflection_memories(self):
+        return list(self.reflections.values())
+
+    def reflection_source(self, source_digest):
+        reflection = self.reflections.get(source_digest)
+        if reflection is None:
+            raise KeyError(source_digest)
+        return {
+            "reflection": reflection,
+            "source": {
+                "source_digest": source_digest,
+                "trajectory_id": reflection["trajectory_id"],
+                "verifier_feedback": "",
+                "trajectory_history": [],
+            },
+        }
+
+    def reflection_memory_regeneration_status(self):
+        return dict(self._reflection_regeneration_status)
+
+    def start_reflection_memory_regeneration(
+        self, source_digest, *, verifier_feedback, expected_document_sha256
+    ):
+        reflection = self.reflections.get(source_digest)
+        if reflection is None:
+            raise KeyError(source_digest)
+        if expected_document_sha256 != reflection["document_sha256"]:
+            raise RuntimeError("stale reflection")
+        self._reflection_regeneration_status = {
+            "job_id": "reflection-regeneration-test",
+            "status": "queued",
+            "stage": "queued",
+            "progress": 0,
+            "message": "重新反思任务已进入后台队列",
+            "details": {
+                "source_digest": source_digest,
+                "verifier_feedback_chars": len(verifier_feedback),
+            },
+        }
+        return dict(self._reflection_regeneration_status)
 
     def policy_data_documents(self, query=""):
         needle = str(query).lower()
@@ -351,6 +408,32 @@ def test_reflection_memory_organization_is_an_explicit_background_job():
     assert runtime.reflection_organization_calls == 1
 
 
+def test_reflection_regeneration_exposes_source_and_background_status():
+    runtime = FakeRuntime()
+    api = client(runtime)
+
+    listing = api.get("/qwen-exo/reflection-memory")
+    source = api.get("/qwen-exo/reflection-memory/source-1/source")
+    idle = api.get("/qwen-exo/reflection-memory/regeneration")
+    started = api.post(
+        "/qwen-exo/reflection-memory/source-1/regenerate",
+        json={
+            "verifier_feedback": "Hidden verifier: four F2P checks failed.",
+            "expected_document_sha256": "a" * 64,
+        },
+    )
+
+    assert listing.status_code == 200
+    assert listing.json()["reflections"][0]["trajectory_id"] == "resp-1"
+    assert source.status_code == 200
+    assert source.json()["source"]["source_digest"] == "source-1"
+    assert idle.status_code == 200
+    assert idle.json()["status"] == "idle"
+    assert started.status_code == 202
+    assert started.json()["job_id"] == "reflection-regeneration-test"
+    assert started.json()["details"]["verifier_feedback_chars"] > 0
+
+
 def test_pending_reflection_management_supports_list_start_and_cancel():
     runtime = FakeRuntime()
     api = client(runtime)
@@ -422,6 +505,22 @@ def test_policy_data_surface_is_singleton_and_has_no_tags():
     assert runtime.policy_documents == {"policy.md": "# Updated Policy"}
     assert rejected.status_code == 409
     assert "one personality document" in rejected.json()["detail"]
+
+
+def test_trajectory_api_is_disabled_without_experimental_flag(tmp_path: Path):
+    runtime = FakeRuntime()
+    runtime.config.feature_flags.activation_training = False
+    runtime.config.state_directory = tmp_path / "state"
+    api = client(runtime)
+
+    for method, path in (
+        (api.get, "/qwen-exo/trajectories"),
+        (api.get, "/qwen-exo/editors"),
+        (api.get, "/qwen-exo/editors/training"),
+    ):
+        response = method(path)
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "activation_training_disabled"
 
 
 def test_trajectory_preview_requires_explicit_create_then_supports_tagged_edit(

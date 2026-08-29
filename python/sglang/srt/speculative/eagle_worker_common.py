@@ -24,6 +24,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
+    commit_qwen_exo_accept_signals,
     generate_token_bitmask,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
@@ -217,7 +218,6 @@ def prepare_for_draft(
     topk: int,
     num_steps: int,
 ):
-
     if not batch.forward_mode.is_idle():
         bs = len(batch.seq_lens)
 
@@ -599,6 +599,12 @@ def run_eagle_verify(
             accept_lens,
             num_draft_tokens,
         )
+    commit_qwen_exo_accept_signals(
+        target_worker,
+        logits_output,
+        accept_lens,
+        linear_chain=topk == 1,
+    )
 
     # Update mamba state for hybrid GDN models after verification
     commit_mamba_states_after_verify(

@@ -19,13 +19,16 @@ const VALID_VIEWS: Record<string, true> = Object.fromEntries(
   NAV_ITEMS.map((item) => [item.id, true]),
 );
 
-function initialView(): ViewId {
+function initialView(status: RuntimeStatus | null): ViewId {
   const hash = window.location.hash.replace(/^#\/?/, "");
+  if (hash === "editor" && !status?.features?.activation_training) {
+    return "overview";
+  }
   return VALID_VIEWS[hash] ? (hash as ViewId) : "overview";
 }
 
 export default function App() {
-  const [view, setView] = useState<ViewId>(initialView);
+  const [view, setView] = useState<ViewId>(() => initialView(null));
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const { dark } = useTheme();
@@ -50,10 +53,24 @@ export default function App() {
   }, [loadStatus, view]);
 
   useEffect(() => {
-    const onHashChange = () => setView(initialView());
+    const onHashChange = () => setView(initialView(status));
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
-  }, []);
+  }, [status]);
+
+  const navigate = useCallback(
+    (next: ViewId) => {
+      setView(next);
+      window.history.replaceState(null, "", `#/${next}`);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (view === "editor" && !status?.features?.activation_training) {
+      navigate("overview");
+    }
+  }, [navigate, status, view]);
 
   useEffect(() => {
     if (statusError)
@@ -63,26 +80,23 @@ export default function App() {
       });
   }, [statusError, t]);
 
-  const navigate = (next: ViewId) => {
-    setView(next);
-    window.history.replaceState(null, "", `#/${next}`);
-  };
-
-  const pages: Record<ViewId, React.ReactNode> = {
+  const pages: Partial<Record<ViewId, React.ReactNode>> = {
     overview: <OverviewPage status={status} onRefresh={loadStatus} />,
     chat: <ChatPage />,
     trace: <TracePage />,
     knowledge: <KnowledgePage />,
     reflection: <ReflectionPage />,
-    editor: <EditorPage />,
     catalog: <CatalogPage status={status} />,
     "api-keys": <ApiKeysPage />,
     settings: <SettingsPage status={status} onStatusRefresh={loadStatus} />,
   };
+  if (status?.features?.activation_training) {
+    pages.editor = <EditorPage />;
+  }
 
   return (
     <AppShell view={view} onView={navigate} status={status}>
-      {pages[view]}
+      {pages[view] ?? pages.overview}
       <Toaster
         richColors
         closeButton

@@ -508,6 +508,16 @@ def test_service_launcher_uses_selected_model_profile(tmp_path: Path, monkeypatc
     assert service_launcher.os.environ["QWEN_EXO_ACTIVE_MODEL_PROFILE"] == str(profile)
 
 
+def test_service_launcher_skips_activation_training_without_experimental_flag(
+    monkeypatch,
+):
+    monkeypatch.delenv("QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING", raising=False)
+    assert service_launcher._activation_training_enabled_from_environment() is False
+
+    monkeypatch.setenv("QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING", "1")
+    assert service_launcher._activation_training_enabled_from_environment() is True
+
+
 def test_service_launcher_selects_state_dtype_from_runtime_quantization():
     assert (
         service_launcher._runtime_state_dtype({"runtime_quantization": "gptq_marlin"})

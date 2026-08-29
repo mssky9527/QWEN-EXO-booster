@@ -9,6 +9,12 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+import shutil
+
+try:
+    from scripts.qwen_exo.stage_unbounded_task import stage_unbounded_agent_task
+except ModuleNotFoundError:
+    from stage_unbounded_task import stage_unbounded_agent_task
 
 
 def _request(url: str, method: str, *, timeout: float = 30) -> str:
@@ -71,12 +77,6 @@ def _parser() -> argparse.ArgumentParser:
         help="Bearer key for the OpenAI-compatible QWEN-EXO endpoint",
     )
     parser.add_argument("--runtime-url", default="http://127.0.0.1:30000")
-    parser.add_argument(
-        "--agent-timeout-multiplier",
-        type=float,
-        default=1.5,
-        help="Pier agent timeout multiplier; defaults to a bounded 1.5x task limit",
-    )
     parser.add_argument("--no-reset-runtime", action="store_true")
     parser.add_argument(
         "--n-tasks",
@@ -120,8 +120,6 @@ def build_command(args: argparse.Namespace) -> list[str]:
         "1",
         "--max-retries",
         "0",
-        "--agent-timeout-multiplier",
-        str(args.agent_timeout_multiplier),
         "--yes",
         "--debug",
         "--ak",
@@ -154,19 +152,25 @@ def main() -> int:
         if not Path(path).exists():
             raise FileNotFoundError(path)
 
-    command = build_command(args)
     if args.dry_run:
-        print(json.dumps(command, indent=2))
+        print(json.dumps(build_command(args), indent=2))
         return 0
 
-    if not args.no_reset_runtime:
-        _reset_runtime(args.runtime_url)
-    pier_env = os.environ.copy()
-    existing_python_path = pier_env.get("PYTHONPATH")
-    pier_env["PYTHONPATH"] = str(Path(args.agent_source)) + (
-        os.pathsep + existing_python_path if existing_python_path else ""
-    )
-    return subprocess.run(command, check=False, env=pier_env).returncode
+    staged_task, staging_root = stage_unbounded_agent_task(args.task)
+    command_args = argparse.Namespace(**vars(args))
+    command_args.task = str(staged_task)
+    try:
+        command = build_command(command_args)
+        if not args.no_reset_runtime:
+            _reset_runtime(args.runtime_url)
+        pier_env = os.environ.copy()
+        existing_python_path = pier_env.get("PYTHONPATH")
+        pier_env["PYTHONPATH"] = str(Path(args.agent_source)) + (
+            os.pathsep + existing_python_path if existing_python_path else ""
+        )
+        return subprocess.run(command, check=False, env=pier_env).returncode
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

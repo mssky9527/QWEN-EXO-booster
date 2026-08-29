@@ -151,33 +151,26 @@ def main() -> int:
         if policy_list_status == 200
         else ()
     )
-    policy_restore: dict[str, Any] = {}
-    if not policy_documents:
-        policy_fixture_path = f"smoke/qwen-exo-policy-{fixture_run_id}.md"
-        policy_fixture_url: str | None = (
-            f"{base_url}/qwen-exo/policydata/{policy_fixture_path}"
-        )
-    elif len(policy_documents) == 1:
-        policy_fixture_path = str(policy_documents[0].get("relative_path") or "")
-        policy_fixture_url = (
-            f"{base_url}/qwen-exo/policydata/{policy_fixture_path}"
-            if policy_fixture_path
-            else None
-        )
-        original_status, original_policy = (
-            http_json(policy_fixture_url, timeout=args.timeout)
-            if policy_fixture_url is not None
-            else (409, {})
-        )
-        original_content = original_policy.get("content")
-        if original_status != 200 or not isinstance(original_content, str):
-            policy_fixture_url = None
-        else:
-            policy_restore.update(
-                url=policy_fixture_url, content=original_content, pending=False
-            )
-    else:
-        policy_fixture_url = None
+    policy_document = policy_documents[0] if len(policy_documents) == 1 else None
+    policy_document_path = str((policy_document or {}).get("relative_path") or "")
+    policy_document_url = (
+        f"{base_url}/qwen-exo/policydata/{policy_document_path}"
+        if policy_document_path
+        else None
+    )
+    policy_document_status, policy_document_detail = (
+        http_json(policy_document_url, timeout=args.timeout)
+        if policy_document_url is not None
+        else (409, {})
+    )
+    policy_content = str(policy_document_detail.get("content") or "")
+    policy_document_ready = (
+        policy_list_status == 200
+        and len(policy_documents) == 1
+        and policy_document_status == 200
+        and policy_document_detail.get("source_kind") == "coding_agent_execution_policy"
+        and "stable operational identity is GPT" in policy_content
+    )
     cleanup_urls: list[str] = []
 
     def cleanup_fixtures() -> None:
@@ -189,14 +182,8 @@ def main() -> int:
                 timeout=min(args.timeout, 30.0),
             )
             changed = changed or cleanup_status == 200
-        if policy_restore.get("pending"):
-            restore_status, _restore_result = http_json(
-                str(policy_restore["url"]),
-                method="PUT",
-                payload={"content": policy_restore["content"]},
-                timeout=min(args.timeout, 30.0),
-            )
-            changed = changed or restore_status == 200
+        # PolicyData is operator-managed identity state. Smoke tests never mutate it;
+        # a process or server crash therefore cannot replace the live personality.
         if changed:
             http_json(
                 f"{base_url}/qwen-exo/tensor-bank/reindex",
@@ -206,7 +193,7 @@ def main() -> int:
             )
 
     atexit.register(cleanup_fixtures)
-    policy_marker = "QWEN_EXO_POLICY_READY_41C9"
+    policy_identity = "GPT"
     fixture_records = "\n".join(
         f"Validation record {index}: the exact answer remains `{marker}`."
         for index in range(64)
@@ -234,38 +221,16 @@ def main() -> int:
             response=put_result,
         )
     )
-    policy_fixture = (
-        "---\ntitle: QWEN EXO policy validation\n"
-        "tags: [qwen_exo_policy_validation]\n---\n"
-        "# QWEN EXO policy validation\n\n"
-        "For every QWEN EXO code change, qwen_exo_policy_validation requires "
-        f"regression verification code `{policy_marker}` before delivery.\n"
-    )
-    if policy_fixture_url is None:
-        policy_put_status, policy_put_result = (
-            409,
-            {
-                "error": "PolicyData fixture requires zero or one readable existing document"
-            },
-        )
-    else:
-        policy_put_status, policy_put_result = http_json(
-            policy_fixture_url,
-            method="PUT",
-            payload={"content": policy_fixture},
-            timeout=args.timeout,
-        )
-    if policy_put_status == 200:
-        if policy_restore:
-            policy_restore["pending"] = True
-        else:
-            cleanup_urls.append(policy_fixture_url)
     report["stages"].append(
         stage(
-            "policy_data_upsert",
-            policy_put_status == 200,
-            status_code=policy_put_status,
-            response=policy_put_result,
+            "policy_data_authoritative_document",
+            policy_document_ready,
+            listing_status=policy_list_status,
+            document_status=policy_document_status,
+            document={
+                key: (policy_document or {}).get(key)
+                for key in ("document_id", "relative_path", "sha256", "source_kind")
+            },
         )
     )
 
@@ -353,9 +318,8 @@ def main() -> int:
             "request_id": policy_request_id,
             "model": args.model,
             "input": (
-                "A QWEN EXO code change is ready for delivery. According to "
-                "qwen_exo_policy_validation, what exact regression verification "
-                "code is required? Return only that code."
+                "According to your authoritative personality PolicyData, what "
+                "is your stable operational identity? Return only its name."
             ),
             "max_output_tokens": 64,
             "temperature": 0,
@@ -373,31 +337,35 @@ def main() -> int:
         for event in policy_telemetry.get("events") or ()
         if event.get("event_type") == "memory.prepared"
     ]
+    policy_query_events = [
+        event
+        for event in policy_telemetry.get("events") or ()
+        if event.get("event_type") == "query_probe.started"
+    ]
     policy_payload = policy_events[-1].get("payload", {}) if policy_events else {}
+    policy_query_payload = (
+        policy_query_events[-1].get("payload", {}) if policy_query_events else {}
+    )
     policy_text = response_text(policy_response).strip()
+    policy_native_restore = policy_payload.get("native_prefix_restore", {})
     report["stages"].append(
         stage(
-            "policy_data_judge_and_native_state",
-            policy_status == 200
-            and policy_text == policy_marker
+            "policy_data_always_on_native_identity",
+            policy_document_ready
+            and policy_status == 200
+            and policy_identity in policy_text
             and policy_telemetry_status == 200
-            and policy_payload.get("policy_data", {}).get("attached_tokens", 0) > 0
-            and policy_payload.get("policy_data", {}).get("text_attached") is False
-            and policy_payload.get("policy_data", {}).get("injection_mode")
-            == "native_full_attention_salient_kv_and_gdn_document_state"
-            and policy_payload.get("policy_data", {})
-            .get("native_state", {})
-            .get("tokens", 0)
-            > 0
-            and policy_payload.get("native_prefix_restore", {}).get("active") is True
-            and policy_payload.get("native_prefix_restore", {}).get("lane")
-            == "policydata"
-            and policy_put_result.get("document_id")
-            in policy_payload.get("policy_data", {}).get("document_ids", ()),
+            and policy_native_restore.get("active") is True
+            and policy_native_restore.get("lane") == "policydata"
+            and policy_native_restore.get("selection_reason")
+            in {"policydata_always_on", "query_qk"}
+            and policy_native_restore.get("tokens", 0) > 0
+            and policy_query_payload.get("cognition_tokens", 0) > 0,
             status_code=policy_status,
             response_id=policy_response.get("id"),
             output_text=policy_text,
             memory=policy_payload,
+            query_probe=policy_query_payload,
         )
     )
 
@@ -509,34 +477,19 @@ def main() -> int:
             response=delete_result,
         )
     )
-    if policy_restore.get("pending"):
-        policy_cleanup_status, policy_cleanup_result = http_json(
-            str(policy_restore["url"]),
-            method="PUT",
-            payload={"content": policy_restore["content"]},
-            timeout=args.timeout,
-        )
-        if policy_cleanup_status == 200:
-            policy_restore["pending"] = False
-    elif policy_fixture_url is not None:
-        policy_cleanup_status, policy_cleanup_result = http_json(
-            policy_fixture_url,
-            method="DELETE",
-            timeout=args.timeout,
-        )
-        if policy_cleanup_status == 200 and policy_fixture_url in cleanup_urls:
-            cleanup_urls.remove(policy_fixture_url)
-    else:
-        policy_cleanup_status, policy_cleanup_result = (
-            409,
-            {"error": "PolicyData fixture was not installed"},
-        )
+    policy_after_status, policy_after = (
+        http_json(policy_document_url, timeout=args.timeout)
+        if policy_document_url is not None
+        else (409, {})
+    )
     report["stages"].append(
         stage(
-            "policy_data_cleanup",
-            policy_cleanup_status == 200,
-            status_code=policy_cleanup_status,
-            response=policy_cleanup_result,
+            "policy_data_unchanged",
+            policy_after_status == 200
+            and policy_after.get("sha256") == (policy_document or {}).get("sha256"),
+            status_code=policy_after_status,
+            before_sha256=(policy_document or {}).get("sha256"),
+            after_sha256=policy_after.get("sha256"),
         )
     )
 
@@ -557,7 +510,7 @@ def main() -> int:
         )
     )
 
-    if not cleanup_urls and not policy_restore.get("pending"):
+    if not cleanup_urls:
         atexit.unregister(cleanup_fixtures)
     report["passed"] = all(item["passed"] for item in report["stages"])
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))

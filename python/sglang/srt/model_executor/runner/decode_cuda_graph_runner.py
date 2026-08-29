@@ -278,7 +278,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.supports_target_verify_for_draft():
+                if (
+                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+                ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
@@ -526,6 +528,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
+            return False
+        # A QWEN-EXO internal/target-only batch is marked NONE while the shared
+        # target ModelRunner still owns the DFLASH algorithm. Its decode graph is
+        # captured at DFLASH verify width (block_size, e.g. 8), so replaying that
+        # graph for a one-token target-only request returns block_size sampled
+        # rows and corrupts the FutureMap relay. There is no width-1 graph in this
+        # runner; use the eager target path and keep DFLASH graphs for real spec
+        # batches.
+        if (
+            self.model_runner.spec_algorithm.is_dflash_family()
+            and forward_batch.spec_algorithm is not None
+            and forward_batch.spec_algorithm.is_none()
+        ):
             return False
 
         ragged_layout = (

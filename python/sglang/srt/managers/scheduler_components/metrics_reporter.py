@@ -752,15 +752,23 @@ class SchedulerMetricsReporter:
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
-        spec_num_steps = 0
-        spec_num_draft_tokens = 0
-        if self.scheduler.spec_algorithm.is_none():
+        batch_spec_algorithm = getattr(batch, "spec_algorithm", None)
+        batch_is_speculative = (
+            not batch_spec_algorithm.is_none()
+            if batch_spec_algorithm is not None
+            else not self.scheduler.spec_algorithm.is_none()
+        )
+        if not batch_is_speculative:
             spec_accept_length = 0
             spec_accept_rate = 0
             spec_cap_length = 0
             spec_block_accept_length = 0
         else:
-            spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
+            spec_accept_length = (
+                self.spec_num_accept_tokens / self.spec_num_forward_ct
+                if self.spec_num_forward_ct > 0
+                else 0
+            )
             num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
             if self.scheduler.server_args.speculative_num_draft_tokens:
                 draft_per_round = (

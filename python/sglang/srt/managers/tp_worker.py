@@ -580,7 +580,11 @@ class TpModelWorker(BaseTpWorker):
 
             if (
                 self.enable_overlap
-                and not self.enable_spec
+                and (
+                    not self.enable_spec
+                    or forward_batch.spec_algorithm is None
+                    or forward_batch.spec_algorithm.is_none()
+                )
                 and forward_batch.sampling_info.grammars is not None
             ):
 

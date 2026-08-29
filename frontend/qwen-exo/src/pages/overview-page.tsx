@@ -103,29 +103,40 @@ export function OverviewPage({
   const [overviewDataLoaded, setOverviewDataLoaded] = useState(false);
   const [overviewDataError, setOverviewDataError] = useState(false);
 
+  const activationTrainingEnabled = Boolean(
+    status?.features?.activation_training,
+  );
+
   const loadOverviewData = useCallback(async () => {
-    const results = await Promise.allSettled([
-      getRequestTraces(1),
-      listTrajectories(),
-      listEditors(),
-    ]);
-    const [traceResult, trajectoryResult, editorResult] = results;
-    if (traceResult.status === "fulfilled") {
-      setLatestTrace(traceResult.value.requests[0] || null);
+    const traceResult = await Promise.allSettled([getRequestTraces(1)]);
+    if (traceResult[0].status === "fulfilled") {
+      setLatestTrace(traceResult[0].value.requests[0] || null);
     }
-    if (trajectoryResult.status === "fulfilled") {
-      setTrajectoryCount(trajectoryResult.value.trajectories.length);
-    }
-    if (editorResult.status === "fulfilled") {
-      setActiveEditor(editorResult.value.active);
+    if (activationTrainingEnabled) {
+      const results = await Promise.allSettled([
+        listTrajectories(),
+        listEditors(),
+      ]);
+      const [trajectoryResult, editorResult] = results;
+      if (trajectoryResult.status === "fulfilled") {
+        setTrajectoryCount(trajectoryResult.value.trajectories.length);
+      }
+      if (editorResult.status === "fulfilled") {
+        setActiveEditor(editorResult.value.active);
+      }
+      setOverviewDataError(
+        results.some((result) => result.status === "rejected"),
+      );
+    } else {
+      setOverviewDataError(traceResult[0].status === "rejected");
     }
     setOverviewDataLoaded(true);
-    setOverviewDataError(
-      results.some((result) => result.status === "rejected"),
-    );
-  }, []);
+  }, [activationTrainingEnabled]);
 
   useEffect(() => {
+    setActiveEditor(null);
+    setTrajectoryCount(null);
+    setOverviewDataLoaded(false);
     void loadOverviewData();
     const timer = window.setInterval(() => void loadOverviewData(), 5000);
     return () => window.clearInterval(timer);
@@ -192,11 +203,13 @@ export function OverviewPage({
       detail: `${t(scoreBiasModeSource(scoreBiasMode))} · ${
         activeEditor
           ? `${activeEditor.editor} ${formatNumber(activeEditor.strength || 1)}×`
-          : overviewDataLoaded
-            ? t("激活编辑器未加载")
-            : t("读取编辑器")
+          : activationTrainingEnabled
+            ? overviewDataLoaded
+              ? t("激活编辑器未加载")
+              : t("读取编辑器")
+            : t("实验功能已下线")
       }`,
-      state: modeState(scoreBiasMode),
+      state: activationTrainingEnabled ? modeState(scoreBiasMode) : "off",
     },
     {
       label: t("工具后证据"),
@@ -259,10 +272,14 @@ export function OverviewPage({
     },
     {
       label: t("轨迹记忆"),
-      value: formatNumber(trajectoryCount),
-      detail: scoreBiasMode
-        ? t(scoreBiasModeSource(scoreBiasMode))
-        : t("读取中"),
+      value: activationTrainingEnabled
+        ? formatNumber(trajectoryCount)
+        : t("已下线"),
+      detail: activationTrainingEnabled
+        ? scoreBiasMode
+          ? t(scoreBiasModeSource(scoreBiasMode))
+          : t("读取中")
+        : t("实验功能未启用"),
       icon: BrainCircuit,
     },
   ];

@@ -258,7 +258,10 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.dflash_utils import (
+    is_dflash_target_only_request,
+    validate_dflash_request,
+)
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -2246,7 +2249,7 @@ class Scheduler(
 
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
-            if error_msg is not None:
+            if error_msg is not None and not is_dflash_target_only_request(req):
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -2647,21 +2650,23 @@ class Scheduler(
             req.qwen_exo_admitted_once = True
             req.qwen_exo_reservation_pending = True
             return True
-        capacity_detail = ""
-        if decision.reason == "workspace_capacity":
-            capacity_detail = (
-                f"; required_workspace_bytes={decision.estimate.workspace_bytes}"
-                f"; available_workspace_bytes={decision.available_workspace_bytes}"
-            )
-        self._reject_qwen_exo_request(
-            req,
-            status_code=HTTPStatus.TOO_MANY_REQUESTS,
-            code="qwen_exo_capacity_exhausted",
-            message=(
-                f"QWEN-EXO capacity admission failed: {decision.reason}"
-                f"{capacity_detail}"
-            ),
-            retry_after=1,
+        req.qwen_exo_admitted_once = False
+        req.qwen_exo_reservation_pending = False
+        if req not in self.waiting_queue:
+            self.waiting_queue.append(req)
+            set_wait_entry = getattr(req.time_stats, "set_wait_queue_entry_time", None)
+            if callable(set_wait_entry):
+                set_wait_entry()
+        self._release_qwen_exo_hybrid_state(req)
+        logger.info(
+            "QWEN-EXO admission queued request %s: reason=%s kv_tokens=%d "
+            "available_kv_tokens=%d request_slots=%d available_request_slots=%d",
+            req.rid,
+            decision.reason,
+            decision.estimate.kv_tokens,
+            decision.available_kv_tokens,
+            decision.estimate.request_slots,
+            decision.available_request_slots,
         )
         return False
 
@@ -3486,6 +3491,11 @@ class Scheduler(
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
+        if running_batch.reqs and all(req.finished() for req in running_batch.reqs):
+            self._release_finished_qwen_exo_states(running_batch.reqs)
+            running_batch.filter_batch()
+            running_batch.batch_is_full = False
+
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
 
@@ -3661,6 +3671,19 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
 
+        internal_waiting = tuple(
+            item
+            for item in self.waiting_queue
+            if (getattr(item.sampling_params, "custom_params", None) or {}).get(
+                "qwen_exo_kind"
+            )
+            == "internal"
+        )
+        if internal_waiting and not any(
+            not item.finished() for item in running_batch.reqs
+        ):
+            running_batch.batch_is_full = False
+
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
@@ -3745,6 +3768,21 @@ class Scheduler(
                 )
 
         rejected_qwen_reqs: List[Req] = []
+        active_running_reqs = tuple(
+            req for req in running_batch.reqs if not req.finished()
+        )
+        active_running_has_target_only = bool(active_running_reqs) and all(
+            is_dflash_target_only_request(req) for req in active_running_reqs
+        )
+        active_running_has_non_target_only = any(
+            not is_dflash_target_only_request(req) for req in active_running_reqs
+        )
+        target_only_waiting = (
+            self.spec_algorithm.is_dflash()
+            and not active_running_has_target_only
+            and any(is_dflash_target_only_request(item) for item in self.waiting_queue)
+        )
+
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
@@ -3752,7 +3790,16 @@ class Scheduler(
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
+            target_only_req = (
+                self.spec_algorithm.is_dflash() and is_dflash_target_only_request(req)
+            )
 
+            if (
+                (target_only_req and active_running_has_non_target_only)
+                or (not target_only_req and active_running_has_target_only)
+                or (target_only_waiting and not target_only_req)
+            ):
+                continue
             running_bs = len(running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 running_batch.batch_is_full = True
@@ -3763,8 +3810,9 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
 
@@ -3859,6 +3907,14 @@ class Scheduler(
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
+        target_only_batch = (
+            self.spec_algorithm.is_dflash()
+            and can_run_list
+            and all(is_dflash_target_only_request(req) for req in can_run_list)
+        )
+        batch_spec_algorithm = (
+            SpeculativeAlgorithm.NONE if target_only_batch else self.spec_algorithm
+        )
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -3866,7 +3922,7 @@ class Scheduler(
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
-            self.spec_algorithm,
+            batch_spec_algorithm,
             chunked_req=self.chunked_req,
         )
 

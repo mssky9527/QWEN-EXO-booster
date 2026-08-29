@@ -66,6 +66,18 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestExperimentalActivationTrainingArgs(CustomTestCase):
+    def test_experimental_activation_training_defaults_off_and_can_be_enabled(self):
+        default_args = ServerArgs(model_path="dummy")
+        self.assertFalse(default_args.qwen_exo_experimental_activation_training)
+
+        enabled = ServerArgs(
+            model_path="dummy",
+            qwen_exo_experimental_activation_training=True,
+        )
+        self.assertTrue(enabled.qwen_exo_experimental_activation_training)
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
@@ -1036,6 +1048,7 @@ class TestDecoupledSpecArgs(CustomTestCase):
             prepare_server_args(
                 ["--model-path", "dummy", "--decoupled-spec-role", "bogus"]
             )
+
     def test_qwen_exo_moe_top_k_cli_round_trip(self):
         server_args = prepare_server_args(
             [
@@ -1054,6 +1067,7 @@ class TestDecoupledSpecArgs(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "requires --enable-qwen-exo"):
             server_args._handle_qwen_exo_runtime()
+
     def test_qwen_exo_moe_extra_experts_cli_round_trip(self):
         server_args = prepare_server_args(
             [
@@ -1077,6 +1091,40 @@ class TestDecoupledSpecArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must be non-negative"):
             server_args._handle_qwen_exo_runtime()
 
+
+class TestQwenExoSpecObserverCapability(CustomTestCase):
+    @staticmethod
+    def _model_config(architecture: str, *, mtp_layers: int = 0):
+        return SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=[architecture],
+                text_config=SimpleNamespace(mtp_num_hidden_layers=mtp_layers),
+            )
+        )
+
+    def test_dflash_uses_target_side_accepted_q(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.speculative_algorithm = "DFLASH"
+        server_args.speculative_draft_model_path = "/draft"
+
+        with patch.object(
+            server_args,
+            "get_model_config",
+            return_value=self._model_config("Qwen3_5ForConditionalGeneration"),
+        ):
+            self.assertTrue(server_args._qwen_exo_target_observer_supported())
+
+    def test_dflash_rejects_target_without_accepted_q_hook(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.speculative_algorithm = "DFLASH"
+        server_args.speculative_draft_model_path = "/draft"
+
+        with patch.object(
+            server_args,
+            "get_model_config",
+            return_value=self._model_config("LlamaForCausalLM"),
+        ):
+            self.assertFalse(server_args._qwen_exo_target_observer_supported())
 
 
 class TestAdaptiveSpecArgs(CustomTestCase):

@@ -1,4 +1,5 @@
 import importlib.util
+import shutil
 import asyncio
 import json
 import sys
@@ -9,6 +10,7 @@ import pytest
 from pydantic import BaseModel
 from scripts.qwen_exo.run_deep_swe_compressed import _parser, build_command
 import scripts.qwen_exo.run_deep_swe_compressed as runner
+from scripts.qwen_exo.stage_unbounded_task import stage_unbounded_agent_task
 
 
 class _InteractiveAgentConfig(BaseModel):
@@ -361,8 +363,8 @@ def test_runner_injects_agent_without_replacing_pier_log_mounts():
     assert "PYTHONPATH=/tmp/qwen-exo-agent" in command
     assert "QWEN_EXO_COMPACTION_ENABLED=0" in command
     assert "--disable-verification" in command
-    timeout_index = command.index("--agent-timeout-multiplier")
-    assert command[timeout_index + 1] == "1.5"
+    assert "--agent-timeout-multiplier" not in command
+
     concurrency_index = command.index("--n-concurrent")
     assert command[concurrency_index + 1] == "1"
     attempts_index = command.index("--n-attempts")
@@ -371,6 +373,29 @@ def test_runner_injects_agent_without_replacing_pier_log_mounts():
     assert command[task_count_index + 1] == "3"
     sample_seed_index = command.index("--sample-seed")
     assert command[sample_seed_index + 1] == "17"
+
+
+def test_stage_unbounded_agent_task_removes_nested_agent_deadlines(tmp_path):
+    dataset = tmp_path / "dataset"
+    task = dataset / "task-a"
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text(
+        "[agent]\ntimeout_sec = 5400\n\n[verifier]\ntimeout_sec = 1800\n",
+        encoding="utf-8",
+    )
+    (dataset / "task.toml").write_text(
+        "[agent]\ntimeout_sec = 5400\n", encoding="utf-8"
+    )
+
+    staged, staging_root = stage_unbounded_agent_task(dataset)
+    try:
+        assert "timeout_sec" not in (staged / "task.toml").read_text()
+        nested = (staged / "task-a" / "task.toml").read_text()
+        assert "[agent]" in nested
+        assert "timeout_sec = 1800" in nested
+        assert "timeout_sec = 5400" not in nested
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
 
 def test_runtime_reset_waits_for_base_health(monkeypatch, capsys):

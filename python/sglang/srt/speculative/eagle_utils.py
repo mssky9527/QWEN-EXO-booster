@@ -48,6 +48,16 @@ if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+    _TREE_KERNEL_ARGUMENT_COUNT = len(
+        torch.ops.sgl_kernel.build_tree_kernel_efficient.default._schema.arguments
+    )
+    _VERIFY_TREE_KERNEL_ARGUMENT_COUNT = len(
+        torch.ops.sgl_kernel.verify_tree_greedy.default._schema.arguments
+    )
+    _TARGET_SAMPLING_KERNEL_ARGUMENT_COUNT = len(
+        torch.ops.sgl_kernel.tree_speculative_sampling_target_only.default._schema.arguments
+    )
 elif _is_cpu:
     from sgl_kernel import (
         build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
@@ -257,20 +267,40 @@ def build_tree_kernel_efficient(
             tree_mask_mode,
         )
     else:
-        sgl_build_tree_kernel_efficient(
-            parent_list,
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-        )
+        if _TREE_KERNEL_ARGUMENT_COUNT >= 12:
+            sgl_build_tree_kernel_efficient(
+                parent_list,
+                top_scores_index,
+                seq_lens,
+                tree_mask,
+                positions,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                topk,
+                spec_steps,
+                num_verify_tokens,
+                tree_mask_mode,
+            )
+        else:
+            if tree_mask_mode != TreeMaskMode.FULL_MASK:
+                raise RuntimeError(
+                    "The installed sgl-kernel only supports the full speculative "
+                    "tree mask; update sgl-kernel to use qlen-only masks."
+                )
+            torch.ops.sgl_kernel.build_tree_kernel_efficient.default(
+                parent_list,
+                top_scores_index,
+                seq_lens,
+                tree_mask,
+                positions,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                topk,
+                spec_steps,
+                num_verify_tokens,
+            )
     return (
         tree_mask,
         positions,
@@ -375,19 +405,37 @@ def verify_tree_greedy_func(
     topk: int = -1,
 ):
     if _is_cuda or _is_hip or _is_musa:
-        from sgl_kernel import verify_tree_greedy
+        if _VERIFY_TREE_KERNEL_ARGUMENT_COUNT >= 9:
+            stream = (
+                torch.musa.current_stream().musa_stream
+                if _is_musa
+                else torch.cuda.current_stream().cuda_stream
+            )
+            torch.ops.sgl_kernel.verify_tree_greedy.default(
+                predicts,
+                accept_index,
+                accept_token_num,
+                candidates,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                target_predict,
+                stream,
+            )
+        else:
+            from sgl_kernel import verify_tree_greedy
 
-        verify_tree_greedy(
-            predicts=predicts,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=accept_token_num,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
-            target_predict=target_predict,
-        )
+            verify_tree_greedy(
+                predicts=predicts,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=accept_token_num,  # mutable
+                candidates=candidates,
+                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+                retrive_index=retrieve_index,
+                retrive_next_token=retrieve_next_token,
+                retrive_next_sibling=retrieve_next_sibling,
+                target_predict=target_predict,
+            )
 
     elif _is_cpu:
         sgl_verify_tree_greedy_cpu(
@@ -722,28 +770,65 @@ def eagle_sample(
         # coins for final sampling
         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
-        sampling_fn(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=verify_input.retrieve_index,
-            retrive_next_token=verify_input.retrieve_next_token,
-            retrive_next_sibling=verify_input.retrieve_next_sibling,
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=get_server_args().speculative_accept_threshold_single,
-            threshold_acc=get_server_args().speculative_accept_threshold_acc,
-            deterministic=True,
-        )
+        threshold_single = get_server_args().speculative_accept_threshold_single
+        threshold_acc = get_server_args().speculative_accept_threshold_acc
+        if use_rejection_sampling:
+            chain_speculative_sampling_triton(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                retrive_index=verify_input.retrieve_index,
+                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_sibling=verify_input.retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=threshold_single,
+                threshold_acc=threshold_acc,
+                deterministic=True,
+            )
+        elif _TARGET_SAMPLING_KERNEL_ARGUMENT_COUNT >= 15:
+            torch.ops.sgl_kernel.tree_speculative_sampling_target_only.default(
+                predict,
+                accept_index,
+                num_correct_drafts,
+                candidates,
+                verify_input.retrieve_index,
+                verify_input.retrieve_next_token,
+                verify_input.retrieve_next_sibling,
+                coins,
+                coins_for_final_sampling,
+                target_probs,
+                draft_probs,
+                threshold_single,
+                threshold_acc,
+                True,
+                (
+                    torch.musa.current_stream().musa_stream
+                    if _is_musa
+                    else torch.cuda.current_stream().cuda_stream
+                ),
+            )
+        else:
+            tree_speculative_sampling_target_only(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+                retrive_index=verify_input.retrieve_index,
+                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_sibling=verify_input.retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=threshold_single,
+                threshold_acc=threshold_acc,
+                deterministic=True,
+            )
 
         # Sync sampling results across TP ranks: different GPUs may
         # produce slightly different target_probs due to floating-point

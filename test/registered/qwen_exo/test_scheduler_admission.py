@@ -301,12 +301,8 @@ def test_internal_workspace_shortage_rejects_without_reservation(monkeypatch):
 
     assert not scheduler._try_qwen_exo_admission(req, is_retracted=False)
     assert scheduler.qwen_exo_admission.reservation_count == 0
-    sent = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
-    assert sent.finished_reason["code"] == "qwen_exo_capacity_exhausted"
-    assert sent.finished_reason["message"] == (
-        "QWEN-EXO capacity admission failed: workspace_capacity; "
-        "required_workspace_bytes=6144; available_workspace_bytes=6143"
-    )
+    assert scheduler.waiting_queue == [req]
+    scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
 
 
 @requires_scheduler
@@ -415,9 +411,8 @@ def test_user_slot_census_deduplicates_overlap_and_pending_reservations():
     assert scheduler._try_qwen_exo_admission(fourth, is_retracted=False)
     assert not scheduler._try_qwen_exo_admission(fifth, is_retracted=False)
     assert scheduler.qwen_exo_admission.reservation_count == 2
-    sent = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
-    assert sent.finished_reason["code"] == "qwen_exo_capacity_exhausted"
-    assert sent.finished_reason["message"].endswith("request_slots")
+    assert scheduler.waiting_queue == [pending, fifth]
+    scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
 
 
 @requires_scheduler
@@ -461,6 +456,7 @@ def test_internal_fanout_cannot_overcommit_mamba_capacity():
     assert not scheduler._try_qwen_exo_admission(second, is_retracted=False)
     assert scheduler.qwen_exo_admission.reservation_count == 1
     assert scheduler.qwen_exo_admission.is_reserved("internal:parent-1:internal-1")
+    assert scheduler.waiting_queue == [second]
 
 
 @requires_scheduler

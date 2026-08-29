@@ -11,6 +11,14 @@ set -euo pipefail
 : "${QWEN_EXO_DTYPE:=bfloat16}"
 : "${QWEN_EXO_QUANTIZATION:=}"
 : "${QWEN_EXO_KV_CACHE_DTYPE:=fp8_e4m3}"
+: "${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING:-0}"
+: "${QWEN_EXO_SPECULATIVE_ALGORITHM:=}"
+: "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_PATH:=}"
+: "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_REVISION:=main}"
+: "${QWEN_EXO_SPECULATIVE_NUM_STEPS:=}"
+: "${QWEN_EXO_SPECULATIVE_EAGLE_TOPK:=}"
+: "${QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS:=}"
+: "${QWEN_EXO_SERVICE_CONFIG_PATH:=/data/qwen-exo/service-config.json}"
 if [[ -n "${QWEN_EXO_QUANTIZATION}" ]]; then
   QWEN_EXO_QUANTIZATION_LABEL="${QWEN_EXO_QUANTIZATION}"
 else
@@ -20,9 +28,11 @@ fi
 : "${QWEN_EXO_USE_JIT_FP8_QUANT:=1}"
 : "${QWEN_EXO_LOGPROB_CHUNK_SIZE:=512}"
 : "${QWEN_EXO_MEM_FRACTION_STATIC:=0.80}"
-: "${QWEN_EXO_MAX_RUNNING_REQUESTS:=64}"
+: "${QWEN_EXO_MAX_RUNNING_REQUESTS:=10}"
 : "${QWEN_EXO_CPU_OFFLOAD_GB:=0}"
 : "${QWEN_EXO_CUDA_GRAPH_MAX_BS:=8}"
+: "${QWEN_EXO_CUDA_GRAPH_BACKEND_DECODE:=full}"
+: "${QWEN_EXO_CUDA_GRAPH_BACKEND_PREFILL:=disabled}"
 : "${QWEN_EXO_PORT:=30000}"
 : "${QWEN_EXO_MAX_INTERNAL_FANOUT:=32}"
 : "${QWEN_EXO_MAX_INTERNAL_TOKENS:=12288}"
@@ -180,11 +190,22 @@ seed_corpus \
   "${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo/corpus/knowledge" \
   "${QWEN_EXO_DATA_PATH}/knowledge"
 # PolicyData is operator-managed and must remain a single document. Seed it only
-# when the persistent lane is empty; never re-expand a live profile on restart.
+# when the persistent lane is empty; never overwrite legitimate operator edits.
+# Recover the exact validation fixture left by smoke_contracts.py before that
+# smoke became non-mutating. This hash guard cannot match a real policy document.
+policy_target="${QWEN_EXO_DATA_PATH}/policydata/coding-agent-execution-policy.md"
+legacy_smoke_policy_sha256="888f47d2e3206c0c7bee46bfb403ed81a73a002c08c18fbf3ef34fdfa763b5e4"
+if [[ -f "${policy_target}" ]] && \
+   [[ "$(sha256sum "${policy_target}" | cut -d ' ' -f 1)" == "${legacy_smoke_policy_sha256}" ]]; then
+  echo "Restoring authoritative PolicyData over a stale validation fixture."
+  install -m 0644 \
+    "${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo/corpus/policydata/coding-agent-execution-policy.md" \
+    "${policy_target}"
+fi
 if ! find "${QWEN_EXO_DATA_PATH}/policydata" -maxdepth 1 -type f \( -name '*.md' -o -name '*.markdown' \) -print -quit | grep -q .; then
   install -m 0644 \
     "${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo/corpus/policydata/coding-agent-execution-policy.md" \
-    "${QWEN_EXO_DATA_PATH}/policydata/coding-agent-execution-policy.md"
+    "${policy_target}"
 fi
 seed_corpus \
   "${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo/corpus/cognition" \
@@ -209,9 +230,11 @@ docker_args=(
   -e "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT=${QWEN_EXO_USE_JIT_FP8_QUANT}"
   -e "SGLANG_LOGPROB_CHUNK_SIZE=${QWEN_EXO_LOGPROB_CHUNK_SIZE}"
   -e "SGLANG_QWEN_EXO_WORKSPACE_SAFETY_RESERVE_MIB=${QWEN_EXO_WORKSPACE_SAFETY_RESERVE_MIB}"
-  -e QWEN_EXO_SERVICE_CONFIG=/data/qwen-exo/service-config.json
+  -e "SGLANG_DFLASH_DISABLE_TORCH_COMPILE=${SGLANG_DFLASH_DISABLE_TORCH_COMPILE:-0}"
+  -e "QWEN_EXO_SERVICE_CONFIG=${QWEN_EXO_SERVICE_CONFIG_PATH}"
   -e QWEN_EXO_API_KEY_STORE=/data/qwen-exo/api-keys.json
   -e QWEN_EXO_MANAGED_RESTART=1
+  -e "QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING=${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING:-0}"
   -e "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR:-}"
   -e "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH:-}"
   -e "QWEN_EXO_MODEL_CATALOG_ROOTS=${QWEN_EXO_MODEL_CATALOG_ROOTS}"
@@ -255,9 +278,12 @@ server_args=(
   --attention-backend triton
   --sampling-backend pytorch
   --disable-custom-all-reduce
-  --cuda-graph-backend-decode full
-  --cuda-graph-backend-prefill disabled
+  --cuda-graph-backend-decode "${QWEN_EXO_CUDA_GRAPH_BACKEND_DECODE}"
+  --cuda-graph-backend-prefill "${QWEN_EXO_CUDA_GRAPH_BACKEND_PREFILL}"
   --cuda-graph-max-bs-decode "${QWEN_EXO_CUDA_GRAPH_MAX_BS}"
+  # Internal QWEN-EXO jobs use negative priorities; keep ordinary user requests
+  # at zero so control-plane work is not ordered behind the implicit min-int default.
+  --default-priority-value 0
   --enable-priority-scheduling
   --mamba-radix-cache-strategy "${QWEN_EXO_MAMBA_STRATEGY}"
   --page-size 64
@@ -269,6 +295,27 @@ server_args=(
   --host 127.0.0.1
   --port "${QWEN_EXO_PORT}"
 )
+if [[ -n "${QWEN_EXO_SPECULATIVE_ALGORITHM}" ]]; then
+  server_args+=( --speculative-algorithm "${QWEN_EXO_SPECULATIVE_ALGORITHM}" )
+  if [[ -n "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_PATH}" ]]; then
+    server_args+=( --speculative-draft-model-path "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_PATH}" )
+  fi
+  if [[ -n "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_REVISION}" ]]; then
+    server_args+=( --speculative-draft-model-revision "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_REVISION}" )
+  fi
+  if [[ -n "${QWEN_EXO_SPECULATIVE_NUM_STEPS}" ]]; then
+    server_args+=( --speculative-num-steps "${QWEN_EXO_SPECULATIVE_NUM_STEPS}" )
+  fi
+  if [[ -n "${QWEN_EXO_SPECULATIVE_EAGLE_TOPK}" ]]; then
+    server_args+=( --speculative-eagle-topk "${QWEN_EXO_SPECULATIVE_EAGLE_TOPK}" )
+  fi
+  if [[ -n "${QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS}" ]]; then
+    server_args+=( --speculative-num-draft-tokens "${QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS}" )
+  fi
+fi
+if [[ "${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING}" == "1" ]]; then
+  server_args+=( --qwen-exo-experimental-activation-training )
+fi
 if [[ -n "${QWEN_EXO_QUANTIZATION}" ]]; then
   server_args+=( --quantization "${QWEN_EXO_QUANTIZATION}" )
 fi

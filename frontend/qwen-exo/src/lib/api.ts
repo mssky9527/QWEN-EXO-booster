@@ -12,6 +12,9 @@ import type {
   RecallTrace,
   RequestTraceListing,
   PendingReflectionMemory,
+  ReflectionMemoryRecord,
+  ReflectionRegenerationJobStatus,
+  ReflectionSourceDetail,
   RuntimeStatus,
   ServiceConfig,
   SourceListing,
@@ -220,6 +223,45 @@ export async function getReflectionMemoryOrganizationStatus() {
   return (await (
     await apiFetch("/reflection-memory/organize")
   ).json()) as ReflectionOrganizationJobStatus;
+}
+
+export async function listReflectionMemories() {
+  return (await (await apiFetch("/reflection-memory")).json()) as {
+    reflections: ReflectionMemoryRecord[];
+  };
+}
+
+export async function getReflectionSource(sourceDigest: string) {
+  return (await (
+    await apiFetch(
+      `/reflection-memory/${encodeURIComponent(sourceDigest)}/source`,
+    )
+  ).json()) as ReflectionSourceDetail;
+}
+
+export async function getReflectionRegenerationStatus() {
+  return (await (
+    await apiFetch("/reflection-memory/regeneration")
+  ).json()) as ReflectionRegenerationJobStatus;
+}
+
+export async function regenerateReflectionMemory(
+  sourceDigest: string,
+  verifierFeedback: string,
+  expectedDocumentSha256: string,
+) {
+  return (await (
+    await apiFetch(
+      `/reflection-memory/${encodeURIComponent(sourceDigest)}/regenerate`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          verifier_feedback: verifierFeedback,
+          expected_document_sha256: expectedDocumentSha256,
+        }),
+      },
+    )
+  ).json()) as ReflectionRegenerationJobStatus;
 }
 
 export async function listPendingReflectionMemories() {

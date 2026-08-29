@@ -59,3 +59,25 @@ def test_private_memory_span_is_strict_and_request_scoped():
         )
         is None
     )
+
+
+def test_native_memory_span_keeps_content_addressed_key_across_requests():
+    native_key = f"qwen-exo-native:{'a' * 64}"
+    params = {
+        "qwen_exo_kind": "user",
+        "qwen_exo_memory_start": 0,
+        "qwen_exo_memory_length": 4,
+        "qwen_exo_memory_key": native_key,
+    }
+
+    first = parse_private_memory_span(params, request_id="r1", prompt_tokens=4)
+    second = parse_private_memory_span(params, request_id="r2", prompt_tokens=4)
+
+    assert first == (0, 4, native_key)
+    assert second == (0, 4, native_key)
+    malformed = parse_private_memory_span(
+        {**params, "qwen_exo_memory_key": "qwen-exo-native:not-a-digest"},
+        request_id="r1",
+        prompt_tokens=4,
+    )
+    assert malformed == (0, 4, "r1:qwen-exo-native:not-a-digest")

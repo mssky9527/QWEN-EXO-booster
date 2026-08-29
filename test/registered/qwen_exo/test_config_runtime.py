@@ -62,6 +62,19 @@ def test_reasoning_budget_is_public_and_positive(tmp_path):
         )
 
 
+def test_experimental_activation_training_defaults_off_and_is_public(tmp_path):
+    config = QwenExoConfig.from_server_args(server_args(tmp_path))
+
+    assert config.feature_flags.activation_training is False
+    assert config.public_dict()["features"]["activation_training"] is False
+
+    enabled = QwenExoConfig.from_server_args(
+        server_args(tmp_path, qwen_exo_experimental_activation_training=True)
+    )
+    assert enabled.feature_flags.activation_training is True
+    assert enabled.public_dict()["features"]["activation_training"] is True
+
+
 def test_response_output_budget_is_public_and_positive(tmp_path):
     config = QwenExoConfig.from_server_args(
         server_args(tmp_path, qwen_exo_max_output_tokens=12288)

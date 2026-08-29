@@ -102,7 +102,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
             batch.input_ids = prefill_gpu
         batch.prefill_input_ids_cpu = None
         batch.mix_running_indices = None
-    elif batch.input_ids is None and future_map.spec_algo.is_none():
+    elif batch.input_ids is None and batch.spec_algorithm.is_none():
         batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(

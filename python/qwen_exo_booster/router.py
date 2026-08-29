@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -99,6 +99,15 @@ class SourceSelectionRequest(BaseModel):
 
 class ReflectionSelectionRequest(BaseModel):
     conversation_keys: list[str] = Field(min_length=1, max_length=1000)
+
+
+class ReflectionRegenerationRequest(BaseModel):
+    verifier_feedback: str = Field(min_length=1, max_length=131_072)
+    expected_document_sha256: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class ApiKeyCreateRequest(BaseModel):
@@ -458,6 +467,22 @@ def _activation_training_store(request: Request) -> ActivationTrainingStore:
     return ActivationTrainingStore(_shared_data_root(request))
 
 
+def _activation_training_enabled(request: Request) -> bool:
+    runtime = _runtime(request)
+    return bool(getattr(runtime.config.feature_flags, "activation_training", False))
+
+
+def require_activation_training(request: Request) -> None:
+    if not _activation_training_enabled(request):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "activation_training_disabled",
+                "message": "轨迹微调是实验功能，当前服务未启用；请使用实验开关重新启动服务。",
+            },
+        )
+
+
 def _editors_root(request: Request) -> Path:
     runtime = _runtime(request)
     root = runtime.config.state_directory / "activation-editors"
@@ -560,12 +585,14 @@ def _read_trajectory_tags(name: str, store: TrajectoryStore) -> list[str]:
         return []
 
 
-@router.get("/trajectories")
+@router.get("/trajectories", dependencies=[Depends(require_activation_training)])
 async def list_trajectories(request: Request):
     return {"trajectories": _trajectory_store(request).list()}
 
 
-@router.post("/trajectories/preview")
+@router.post(
+    "/trajectories/preview", dependencies=[Depends(require_activation_training)]
+)
 async def preview_trajectory(payload: TrajectoryPreviewRequest):
     try:
         data = base64.b64decode(payload.content_base64, validate=True)
@@ -593,7 +620,11 @@ async def preview_trajectory(payload: TrajectoryPreviewRequest):
     }
 
 
-@router.post("/trajectories", status_code=201)
+@router.post(
+    "/trajectories",
+    status_code=201,
+    dependencies=[Depends(require_activation_training)],
+)
 async def create_trajectory(payload: TrajectoryCreateRequest, request: Request):
     try:
         document = json.loads(payload.content)
@@ -610,7 +641,7 @@ async def create_trajectory(payload: TrajectoryCreateRequest, request: Request):
         )
 
 
-@router.get("/trajectories/{name}")
+@router.get("/trajectories/{name}", dependencies=[Depends(require_activation_training)])
 async def get_trajectory(name: str, request: Request):
     try:
         return _trajectory_store(request).get(name)
@@ -618,7 +649,7 @@ async def get_trajectory(name: str, request: Request):
         raise HTTPException(status_code=404, detail=exc.message)
 
 
-@router.put("/trajectories/{name}")
+@router.put("/trajectories/{name}", dependencies=[Depends(require_activation_training)])
 async def put_trajectory(name: str, payload: TrajectoryWriteRequest, request: Request):
     store = _trajectory_store(request)
     target_name = str(payload.name).strip() if payload.name is not None else name
@@ -648,7 +679,9 @@ async def put_trajectory(name: str, payload: TrajectoryWriteRequest, request: Re
         )
 
 
-@router.patch("/trajectories/{name}")
+@router.patch(
+    "/trajectories/{name}", dependencies=[Depends(require_activation_training)]
+)
 async def rename_trajectory(
     name: str, payload: TrajectoryRenameRequest, request: Request
 ):
@@ -665,7 +698,9 @@ async def rename_trajectory(
         )
 
 
-@router.delete("/trajectories/{name}")
+@router.delete(
+    "/trajectories/{name}", dependencies=[Depends(require_activation_training)]
+)
 async def delete_trajectory(name: str, request: Request):
     try:
         _trajectory_store(request).delete(name)
@@ -676,7 +711,7 @@ async def delete_trajectory(name: str, request: Request):
     return {"deleted": True, "name": name}
 
 
-@router.get("/editors")
+@router.get("/editors", dependencies=[Depends(require_activation_training)])
 async def list_editors(request: Request):
     root = _editors_root(request)
     trajectory_store = _trajectory_store(request)
@@ -691,7 +726,9 @@ async def list_editors(request: Request):
     return {"editors": editors, "active": _active_editor(root)}
 
 
-@router.get("/editors/training-selection")
+@router.get(
+    "/editors/training-selection", dependencies=[Depends(require_activation_training)]
+)
 async def get_editor_training_selection(request: Request):
     try:
         return _training_selection_status(request)
@@ -699,7 +736,9 @@ async def get_editor_training_selection(request: Request):
         return JSONResponse(status_code=503, content={"detail": exc.public_dict()})
 
 
-@router.put("/editors/training-selection")
+@router.put(
+    "/editors/training-selection", dependencies=[Depends(require_activation_training)]
+)
 async def put_editor_training_selection(
     payload: TrainingSelectionRequest, request: Request
 ):
@@ -717,7 +756,7 @@ async def put_editor_training_selection(
         )
 
 
-@router.get("/editors/training")
+@router.get("/editors/training", dependencies=[Depends(require_activation_training)])
 async def get_editor_training(request: Request):
     try:
         return _activation_training_store(request).public_status()
@@ -725,7 +764,11 @@ async def get_editor_training(request: Request):
         return JSONResponse(status_code=503, content={"detail": exc.public_dict()})
 
 
-@router.post("/editors/train", status_code=202)
+@router.post(
+    "/editors/train",
+    status_code=202,
+    dependencies=[Depends(require_activation_training)],
+)
 async def train_editor(request: Request):
     if not ServiceConfigStore.from_environment().managed_restart:
         return JSONResponse(
@@ -765,6 +808,41 @@ async def train_editor(request: Request):
 @router.get("/reflection-memory")
 async def list_reflection_memories(request: Request):
     return {"reflections": _runtime(request).reflection_memories()}
+
+
+@router.get("/reflection-memory/regeneration")
+async def reflection_memory_regeneration_status(request: Request):
+    return _runtime(request).reflection_memory_regeneration_status()
+
+
+@router.get("/reflection-memory/{source_digest}/source")
+async def get_reflection_memory_source(source_digest: str, request: Request):
+    try:
+        return _runtime(request).reflection_source(source_digest)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="关联轨迹不存在")
+
+
+@router.post("/reflection-memory/{source_digest}/regenerate", status_code=202)
+async def regenerate_reflection_memory(
+    source_digest: str,
+    payload: ReflectionRegenerationRequest,
+    request: Request,
+):
+    try:
+        return _runtime(request).start_reflection_memory_regeneration(
+            source_digest,
+            verifier_feedback=payload.verifier_feedback,
+            expected_document_sha256=payload.expected_document_sha256,
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail="Reflection Memory 或关联轨迹不存在"
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.get("/reflection-memory/organize")

@@ -675,6 +675,28 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     batch.mamba_track_seqlens = None
 
 
+def commit_qwen_exo_accept_signals(
+    target_worker: TpModelWorker,
+    logits_output,
+    num_accept_tokens: torch.Tensor,
+    *,
+    linear_chain: bool,
+) -> None:
+    """Publish accepted verify-token signals without exposing rejected branches."""
+
+    model = target_worker.model_runner.model
+    commit = getattr(model, "commit_qwen_exo_accept_signals", None)
+    if callable(commit) and linear_chain:
+        commit(logits_output, num_accept_tokens)
+        return
+    customized_info = getattr(logits_output, "customized_info", None)
+    if isinstance(customized_info, dict):
+        for key in tuple(customized_info):
+            if key.startswith("_qwen_exo_spec_"):
+                customized_info.pop(key, None)
+        logits_output.customized_info = customized_info or None
+
+
 def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,

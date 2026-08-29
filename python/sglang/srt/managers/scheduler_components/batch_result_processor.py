@@ -58,6 +58,55 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_QWEN_EXO_PER_TOKEN_CUSTOMIZED_INFO = frozenset(
+    {
+        "qwen_exo_q_norm",
+        "qwen_exo_q_drift",
+        "qwen_exo_memory_energy",
+        "qwen_exo_q_sketch",
+        "qwen_exo_k_sketch",
+    }
+)
+
+
+def _copy_customized_value(key: str, value):
+    if isinstance(value, torch.Tensor):
+        if key.startswith("qwen_exo_"):
+            copied = value.detach().float().cpu()
+            return (
+                float(copied.item())
+                if copied.numel() == 1
+                else copied.reshape(-1).tolist()
+            )
+        return value.clone()
+    if hasattr(value, "copy") and callable(value.copy):
+        return value.copy()
+    return value
+
+
+def _customized_values_for_accept(
+    key: str,
+    value,
+    row: int,
+    *,
+    num_accept_tokens: int,
+    speculative_num_draft_tokens: Optional[int],
+):
+    row_value = value[row]
+    if speculative_num_draft_tokens is None or not key.startswith("qwen_exo_"):
+        return (_copy_customized_value(key, row_value),)
+    count = max(0, int(num_accept_tokens))
+    stride = int(speculative_num_draft_tokens)
+    if (
+        key in _QWEN_EXO_PER_TOKEN_CUSTOMIZED_INFO
+        and isinstance(row_value, torch.Tensor)
+        and row_value.ndim >= 1
+        and int(row_value.shape[0]) == stride
+    ):
+        return tuple(_copy_customized_value(key, item) for item in row_value[:count])
+    copied = _copy_customized_value(key, row_value)
+    return tuple(copied for _ in range(count))
+
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
@@ -170,6 +219,9 @@ class SchedulerBatchResultProcessor:
         i: int,
         req: Req,
         logits_output: LogitsProcessorOutput,
+        *,
+        num_accept_tokens: int = 1,
+        speculative_num_draft_tokens: Optional[int] = None,
     ):
         bank_cache_status = getattr(req, "qwen_exo_bank_cache_status", None)
         bank_export_status = getattr(req, "qwen_exo_bank_export_status", None)
@@ -187,25 +239,16 @@ class SchedulerBatchResultProcessor:
         if logits_output is not None and logits_output.customized_info is not None:
             if req.customized_info is None:
                 req.customized_info = {}
-            for k, v in logits_output.customized_info.items():
-                if k not in req.customized_info:
-                    req.customized_info[k] = []
-                # Copy the element so it doesn't retain the entire batch
-                # tensor/array via a view reference.
-                elem = v[i]
-                if isinstance(elem, torch.Tensor):
-                    if k.startswith("qwen_exo_"):
-                        copied = elem.detach().float().cpu()
-                        elem = (
-                            float(copied.item())
-                            if copied.numel() == 1
-                            else copied.reshape(-1).tolist()
-                        )
-                    else:
-                        elem = elem.clone()
-                elif hasattr(elem, "copy") and callable(elem.copy):
-                    elem = elem.copy()
-                req.customized_info[k].append(elem)
+            for key, value in logits_output.customized_info.items():
+                req.customized_info.setdefault(key, []).extend(
+                    _customized_values_for_accept(
+                        key,
+                        value,
+                        i,
+                        num_accept_tokens=num_accept_tokens,
+                        speculative_num_draft_tokens=speculative_num_draft_tokens,
+                    )
+                )
 
     def process_batch_result_prefill(
         self,
@@ -750,7 +793,14 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            self._handle_finish_state_updated_req(
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                num_accept_tokens=new_accept_len,
+            )
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -898,6 +948,8 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
+        *,
+        num_accept_tokens: int,
     ):
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
@@ -949,7 +1001,13 @@ class SchedulerBatchResultProcessor:
 
             req.time_stats.set_completion_time()
 
-        self._maybe_collect_customized_info(i, req, logits_output)
+        self._maybe_collect_customized_info(
+            i,
+            req,
+            logits_output,
+            num_accept_tokens=num_accept_tokens,
+            speculative_num_draft_tokens=result.speculative_num_draft_tokens,
+        )
 
     def _maybe_update_reasoning_tokens(
         self,

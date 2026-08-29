@@ -12,6 +12,10 @@ from qwen_exo_booster.contracts import stable_digest
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
 from qwen_exo_booster.observer import MidThinkEvent, ObserverResult
 from qwen_exo_booster.query_probe import QueryStateSpan
+from qwen_exo_booster.reflection_memory import (
+    ReflectionMemory,
+    ReflectionSourceSnapshot,
+)
 from qwen_exo_booster.runtime import (
     PendingReflectionMemory,
     QwenExoCapacityConflict,
@@ -255,6 +259,116 @@ async def test_pending_reflection_can_be_cancelled(tmp_path):
     assert work.conversation_key not in value._reflection_memory_tasks
 
 
+@pytest.mark.asyncio
+async def test_reflection_regeneration_is_recoverable_and_rejects_duplicates(tmp_path):
+    value = runtime(tmp_path)
+    value.tensor_bank = object()
+    value.query_probe = object()
+    document = value.knowledge.upsert(
+        "reflection-memory/associated.md",
+        "---\nsource_kind: trajectory_reflection\n"
+        "document_group: reflection_memory\nreflection_memory_schema: 3\n"
+        "title: 关联反思\n---\n\n旧的反思规则。",
+    )
+    reflection = ReflectionMemory(
+        trajectory_id="resp-associated",
+        conversation_key="conversation-associated",
+        source_digest="source-associated",
+        title="关联反思",
+        outcome="mixed",
+        reflection="旧反思",
+        evidence="旧证据",
+        causal_analysis="旧因果",
+        reusable_experience="旧经验",
+        avoid="旧禁忌",
+        next_time="旧计划",
+        memory_action="insert",
+        target_document_path=None,
+        target_document_sha256=None,
+        source_event_count=1,
+        source_token_count=512,
+        attempts=1,
+        created_at=1.0,
+        document_path=document.relative_path,
+        document_sha256=document.sha256,
+        native_source_digest="bank-before",
+        hot_updated=True,
+        publication_status="published",
+    )
+    value.reflection_memory_store.append(reflection)
+    value.reflection_source_store.save(
+        ReflectionSourceSnapshot(
+            source_digest=reflection.source_digest,
+            trajectory_id=reflection.trajectory_id,
+            conversation_key=reflection.conversation_key,
+            original_task="Repair the GraphQL stream",
+            trajectory_history=(
+                {"kind": "tool_observation", "content": "17 checks passed"},
+            ),
+            capsule_history=(),
+            verifier_feedback="",
+            source_event_count=1,
+            source_token_count=512,
+            source_audit={"source_tokens": 128},
+            captured_at=1.0,
+        )
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    captures = []
+
+    class RegenerationService:
+        async def reflect(self, **kwargs):
+            captures.append(kwargs)
+            kwargs["stage_callback"]("qk_retrieval")
+            kwargs["stage_callback"]("model_review")
+            started.set()
+            await release.wait()
+            kwargs["stage_callback"]("publishing")
+            return replace(
+                reflection,
+                source_digest="source-regenerated",
+                memory_action="update",
+                target_document_path=document.relative_path,
+                target_document_sha256=document.sha256,
+                merge_document_paths=(document.relative_path,),
+                merge_document_sha256s=((document.relative_path, document.sha256),),
+                document_sha256="b" * 64,
+                native_source_digest="bank-after",
+            )
+
+    value.reflection_memory_service = RegenerationService()
+    feedback = "Hidden verifier: four F2P checks failed after timeout."
+
+    accepted = value.start_reflection_memory_regeneration(
+        reflection.source_digest,
+        verifier_feedback=feedback,
+        expected_document_sha256=document.sha256,
+    )
+    await started.wait()
+    running = value.reflection_memory_regeneration_status()
+    with pytest.raises(RuntimeError, match="already running"):
+        value.start_reflection_memory_regeneration(
+            reflection.source_digest,
+            verifier_feedback=feedback,
+            expected_document_sha256=document.sha256,
+        )
+    release.set()
+    await value._reflection_memory_regeneration_task
+    completed = value.reflection_memory_regeneration_status()
+
+    assert accepted["status"] == "queued"
+    assert running["status"] == "running"
+    assert running["stage"] == "model_review"
+    assert completed["status"] == "succeeded"
+    assert completed["result"]["source_digest"] == "source-regenerated"
+    assert captures[0]["verifier_feedback"] == feedback
+    assert captures[0]["required_update_target"].document_path == document.relative_path
+    listed = value.reflection_memories()[0]
+    assert listed["source_available"] is True
+    assert listed["trajectory_source"]["trajectory_id"] == reflection.trajectory_id
+
+
 def test_reflection_memory_input_rows_keep_user_reasoning_and_tool_history():
     rows = QwenExoRuntime._reflection_memory_input_rows(
         [
@@ -284,8 +398,30 @@ def test_reflection_memory_input_rows_keep_user_reasoning_and_tool_history():
     assert rows[-1]["content"] == "WFP_LAYER_ALE_AUTH_CONNECT_V4"
 
 
+def test_activation_editor_request_is_disabled_without_experimental_flag(tmp_path):
+    value = runtime(tmp_path)
+    root = value.config.state_directory / "activation-editors"
+    root.mkdir(parents=True)
+    (root / "combined-trajectories.editor.pt").write_bytes(b"artifact")
+    (root / "active.json").write_text(
+        json.dumps({"editor": "combined-trajectories", "strength": 1.0}),
+        encoding="utf-8",
+    )
+
+    request = value.activation_editor_request()
+
+    assert request["spec"] is None
+    assert request["cache_identity"] == stable_digest(
+        "activation-editor-v1", "experimental-disabled"
+    )
+
+
 def test_activation_editor_identity_isolated_in_radix_cache(tmp_path):
     value = runtime(tmp_path)
+    value.config = replace(
+        value.config,
+        feature_flags=replace(value.config.feature_flags, activation_training=True),
+    )
     root = value.config.state_directory / "activation-editors"
     root.mkdir(parents=True)
     artifact = root / "combined-trajectories.editor.pt"

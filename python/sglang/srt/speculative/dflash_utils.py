@@ -389,6 +389,12 @@ class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
     num_target_layers: Optional[int]
     block_size: Optional[int]
+    conv_kernel_size: int
+    conv_group_size: int
+    selector_rank: int
+    selector_top_k: int
+    output_multiplier: float
+    final_logit_softcapping: Optional[float]
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
@@ -467,6 +473,44 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         min_value=1,
     )
 
+    conv_kernel_size = _parse_optional_int(
+        dflash_cfg.get("conv_kernel_size", 0),
+        field_name="DFLASH conv_kernel_size",
+        min_value=0,
+    )
+    conv_group_size = _parse_optional_int(
+        dflash_cfg.get("conv_group_size", 0),
+        field_name="DFLASH conv_group_size",
+        min_value=0,
+    )
+    if bool(conv_kernel_size) != bool(conv_group_size):
+        raise ValueError(
+            "DFLASH grouped convolution needs conv_kernel_size and conv_group_size "
+            f"together. Got conv_kernel_size={conv_kernel_size}, "
+            f"conv_group_size={conv_group_size}."
+        )
+    selector_rank = _parse_optional_int(
+        dflash_cfg.get("selector_rank", 0),
+        field_name="DFLASH selector rank",
+        min_value=0,
+    )
+    selector_top_k = _parse_optional_int(
+        dflash_cfg.get("selector_top_k", 0),
+        field_name="DFLASH selector top_k",
+        min_value=0,
+    )
+    if bool(selector_rank) != bool(selector_top_k):
+        raise ValueError(
+            "DFLASH selector needs rank and top_k together. "
+            f"Got rank={selector_rank}, top_k={selector_top_k}."
+        )
+
+    output_multiplier = float(dflash_cfg.get("output_multiplier", 1.0))
+    if output_multiplier <= 0:
+        raise ValueError("DFLASH output_multiplier must be positive.")
+    softcap = float(dflash_cfg.get("final_logit_softcapping") or 0.0)
+    final_logit_softcapping = softcap if softcap > 0 else None
+
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
@@ -514,10 +558,27 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
         block_size=block_size,
+        conv_kernel_size=conv_kernel_size,
+        conv_group_size=conv_group_size,
+        selector_rank=selector_rank,
+        selector_top_k=selector_top_k,
+        output_multiplier=output_multiplier,
+        final_logit_softcapping=final_logit_softcapping,
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
     )
+
+
+# is_floating_point() is True for fp8; list dtypes explicitly.
+_DENSE_HEAD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def is_dense_head_weight(weight: Any) -> bool:
+    """Whether an lm_head weight can be read as a plain matrix. A quantized head
+    stores packed values, which a dense matmul would read as if they were
+    activations."""
+    return weight is not None and weight.dtype in _DENSE_HEAD_DTYPES
 
 
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
@@ -793,22 +854,28 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
-    if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
+def is_dflash_target_only_request(req: Req) -> bool:
+    """Keep every QWEN-EXO internal job on the target-only scheduler path."""
+    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    return custom_params.get("qwen_exo_kind") == "internal"
 
+
+def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
-    if (
-        req.sampling_params.json_schema is not None
-        or req.sampling_params.regex is not None
-        or req.sampling_params.ebnf is not None
-        or req.sampling_params.structural_tag is not None
-    ):
+    grammar_requested = any(
+        value is not None
+        for value in (
+            req.sampling_params.json_schema,
+            req.sampling_params.regex,
+            req.sampling_params.ebnf,
+            req.sampling_params.structural_tag,
+        )
+    )
+    if grammar_requested and not is_dflash_target_only_request(req):
         return (
             "DFLASH speculative decoding does not support "
             "grammar-constrained decoding yet."
         )
-
     return None

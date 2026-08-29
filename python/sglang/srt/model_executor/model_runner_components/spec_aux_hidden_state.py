@@ -12,6 +12,23 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
+_MUSE_LAYER_OUTPUT_DRAFT_ARCHITECTURES = frozenset(
+    {"DFlash2DraftModel", "MuseGlimmerAssistantModel"}
+)
+
+
+def _map_muse_target_layer_ids(*, target_hf_config, draft_hf_config, layer_ids):
+    architectures = getattr(draft_hf_config, "architectures", None) or []
+    uses_layer_outputs = getattr(
+        target_hf_config, "model_type", None
+    ) == "muse_glimmer" and bool(
+        _MUSE_LAYER_OUTPUT_DRAFT_ARCHITECTURES.intersection(architectures)
+    )
+    return (
+        [int(layer_id) + 1 for layer_id in layer_ids]
+        if uses_layer_outputs
+        else layer_ids
+    )
 
 
 class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
@@ -142,6 +159,11 @@ def _resolve_dflash_aux_hidden_state(
         target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
             target_num_layers=int(target_num_layers),
             draft_num_layers=int(draft_num_layers),
+        )
+        target_layer_ids = _map_muse_target_layer_ids(
+            target_hf_config=model_config.hf_config,
+            draft_hf_config=draft_model_config.hf_config,
+            layer_ids=target_layer_ids,
         )
 
         if spec_algorithm.is_dspark():

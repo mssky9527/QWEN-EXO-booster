@@ -43,6 +43,12 @@ def _runtime_state_dtype(selected_model: dict[str, object]) -> str:
     )
 
 
+def _activation_training_enabled_from_environment() -> bool:
+    return os.getenv(
+        "QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def main() -> None:
     base_args = sys.argv[1:]
     if base_args[:1] == ["--"]:
@@ -89,22 +95,23 @@ def main() -> None:
     from qwen_exo_booster.activation_training import run_pending_activation_training
     from qwen_exo_booster.service_config import ServiceConfigError, ServiceConfigStore
 
-    try:
-        training = run_pending_activation_training(
-            model_path=os.getenv("QWEN_EXO_ACTIVE_MODEL_PATH") or None
-        )
-        if training is not None:
+    if _activation_training_enabled_from_environment():
+        try:
+            training = run_pending_activation_training(
+                model_path=os.getenv("QWEN_EXO_ACTIVE_MODEL_PATH") or None
+            )
+            if training is not None:
+                print(
+                    "QWEN-EXO activation training "
+                    f"{training.get('status')}: {training.get('editor')}",
+                    flush=True,
+                )
+        except Exception as exc:
             print(
-                "QWEN-EXO activation training "
-                f"{training.get('status')}: {training.get('editor')}",
+                f"QWEN-EXO activation training coordinator failed closed: {exc}",
+                file=sys.stderr,
                 flush=True,
             )
-    except Exception as exc:
-        print(
-            f"QWEN-EXO activation training coordinator failed closed: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
 
     store = ServiceConfigStore.from_environment()
     try:

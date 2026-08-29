@@ -139,6 +139,10 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
+
+_QWEN_EXO_SPEC_Q_ROWS = "_qwen_exo_spec_q_rows"
+_QWEN_EXO_SPEC_REQUEST_SLOTS = "_qwen_exo_spec_request_slots"
+_QWEN_EXO_SPEC_OBSERVE_MASK = "_qwen_exo_spec_observe_mask"
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -1333,6 +1337,30 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             return
 
         observe_mask = tuple(forward_batch.qwen_exo_observe or ())
+        if forward_batch.forward_mode.is_target_verify():
+            request_slots = forward_batch.req_pool_indices
+            batch_size = int(request_slots.shape[0])
+            staged_q = tracker.stage_speculative_q(
+                self._qwen_exo_inverse_rope(q, positions)
+            )
+            if batch_size < 1 or staged_q.shape[0] % batch_size:
+                raise ValueError(
+                    "QWEN-EXO speculative Q rows do not match the verify batch"
+                )
+            row_mask = forward_batch.qwen_exo_observe_mask
+            if row_mask is None:
+                row_mask = torch.tensor(
+                    observe_mask,
+                    dtype=torch.bool,
+                    device=staged_q.device,
+                )
+            forward_batch.qwen_exo_customized_info = {
+                **(getattr(forward_batch, "qwen_exo_customized_info", None) or {}),
+                _QWEN_EXO_SPEC_Q_ROWS: staged_q.reshape(batch_size, -1, self.head_dim),
+                _QWEN_EXO_SPEC_REQUEST_SLOTS: request_slots,
+                _QWEN_EXO_SPEC_OBSERVE_MASK: row_mask[:batch_size],
+            }
+            return
         if forward_batch.forward_mode.is_decode():
             row_mask = forward_batch.qwen_exo_observe_mask
             if row_mask is None:
@@ -1893,6 +1921,38 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         return hidden_states, aux_hidden_states
 
+    def commit_qwen_exo_accept_signals(
+        self, logits_output, num_accept_tokens: torch.Tensor
+    ) -> None:
+        info = getattr(logits_output, "customized_info", None)
+        if not isinstance(info, dict):
+            return
+        q_rows = info.pop(_QWEN_EXO_SPEC_Q_ROWS, None)
+        request_slots = info.pop(_QWEN_EXO_SPEC_REQUEST_SLOTS, None)
+        row_mask = info.pop(_QWEN_EXO_SPEC_OBSERVE_MASK, None)
+        if q_rows is None or request_slots is None or row_mask is None:
+            logits_output.customized_info = info or None
+            return
+        tracker = next(
+            (
+                tracker
+                for layer in reversed(self.layers)
+                if (tracker := getattr(layer, "qwen_exo_signal_tracker", None))
+                is not None
+            ),
+            None,
+        )
+        if tracker is not None:
+            info.update(
+                tracker.observe_accept_q(
+                    q_rows,
+                    request_slots,
+                    row_mask,
+                    num_accept_tokens,
+                )
+            )
+        logits_output.customized_info = info or None
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -2204,6 +2264,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
 
+    def commit_qwen_exo_accept_signals(
+        self, logits_output, num_accept_tokens: torch.Tensor
+    ) -> None:
+        self.model.commit_qwen_exo_accept_signals(logits_output, num_accept_tokens)
+
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
@@ -2365,6 +2430,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
+    def commit_qwen_exo_accept_signals(
+        self, logits_output, num_accept_tokens: torch.Tensor
+    ) -> None:
+        self.model.commit_qwen_exo_accept_signals(logits_output, num_accept_tokens)
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)

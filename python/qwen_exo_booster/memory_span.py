@@ -1,6 +1,8 @@
 from __future__ import annotations
-
+import re
 from typing import Any
+
+_NATIVE_MEMORY_KEY = re.compile(r"qwen-exo-native:[0-9a-f]{64}")
 
 
 def find_token_subsequence(haystack: list[int], needle: list[int]) -> int | None:
@@ -57,4 +59,5 @@ def parse_private_memory_span(
         return None
     if start < 0 or length < 1 or start + length > int(prompt_tokens):
         return None
-    return start, length, f"{request_id}:{key}"
+    scoped_key = key if _NATIVE_MEMORY_KEY.fullmatch(key) else f"{request_id}:{key}"
+    return start, length, scoped_key

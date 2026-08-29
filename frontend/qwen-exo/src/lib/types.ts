@@ -180,6 +180,87 @@ export type PendingReflectionMemory = {
   timeout_remaining_seconds: number;
   started_at?: number | null;
 };
+
+export type ReflectionTrajectorySource = {
+  source_digest: string;
+  trajectory_id: string;
+  conversation_key: string;
+  captured_at: number;
+  supersedes_source_digest?: string | null;
+  source_event_count: number;
+  source_token_count: number;
+  trajectory_row_count: number;
+  capsule_count: number;
+  verifier_feedback_present: boolean;
+};
+
+export type ReflectionMemoryRecord = {
+  trajectory_id: string;
+  conversation_key: string;
+  source_digest: string;
+  title: string;
+  outcome: "success" | "failure" | "mixed" | "uncertain";
+  reflection: string;
+  evidence: string;
+  causal_analysis: string;
+  conflict_resolution: string;
+  reusable_experience: string;
+  avoid: string;
+  next_time: string;
+  source_event_count: number;
+  source_token_count: number;
+  created_at: number;
+  document_path?: string | null;
+  document_sha256?: string | null;
+  native_source_digest?: string | null;
+  publication_status: string;
+  hot_updated: boolean;
+  source_available: boolean;
+  trajectory_source?: ReflectionTrajectorySource | null;
+};
+
+export type ReflectionSourceDetail = {
+  reflection: ReflectionMemoryRecord;
+  source: ReflectionTrajectorySource & {
+    original_task: string;
+    trajectory_history: Array<Record<string, unknown>>;
+    capsule_history: Array<Record<string, unknown>>;
+    verifier_feedback: string;
+    source_audit: Record<string, unknown>;
+  };
+};
+
+export type ReflectionRegenerationJobStatus = {
+  job_id: string | null;
+  status: "idle" | "queued" | "running" | "succeeded" | "failed";
+  stage:
+    | "idle"
+    | "queued"
+    | "loading_source"
+    | "qk_retrieval"
+    | "model_review"
+    | "publishing"
+    | "completed"
+    | "failed";
+  progress: number;
+  message: string;
+  queued_at?: number | null;
+  started_at?: number | null;
+  updated_at?: number | null;
+  finished_at?: number | null;
+  details?: Record<string, number | string | boolean | null>;
+  result?: {
+    source_digest: string;
+    supersedes_source_digest: string;
+    trajectory_id: string;
+    document_path?: string | null;
+    document_sha256?: string | null;
+    native_source_digest?: string | null;
+    publication_status: string;
+    hot_updated: boolean;
+  } | null;
+  error?: string | null;
+};
 export type ServiceSetting = {
   key: string;
   group: string;

@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 SUMMARY_SCHEMA_VERSION = 1
 
 
@@ -41,7 +40,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", default="openai/qwen-exo")
     parser.add_argument("--max-attempts", type=int, default=5)
-    parser.add_argument("--agent-timeout-multiplier", type=float, default=1.5)
     parser.add_argument(
         "--first-pass-pid",
         type=int,
@@ -297,8 +295,6 @@ def _run_attempt(
         args.model,
         "--config",
         args.config,
-        "--agent-timeout-multiplier",
-        str(args.agent_timeout_multiplier),
     ]
     print(
         f"[pass-at-k] task={task_id} attempt={attempt}/{args.max_attempts}",
@@ -330,7 +326,9 @@ def main() -> int:
     dataset = Path(args.dataset)
     first_pass_dir = Path(args.first_pass_dir)
     jobs_dir = Path(args.jobs_dir)
-    summary_path = Path(args.summary) if args.summary else jobs_dir / "pass-at-k-summary.json"
+    summary_path = (
+        Path(args.summary) if args.summary else jobs_dir / "pass-at-k-summary.json"
+    )
     for path in (dataset, first_pass_dir, Path(args.runner), Path(args.config)):
         if not path.exists():
             raise FileNotFoundError(path)
@@ -371,10 +369,13 @@ def main() -> int:
         task = summary["tasks"][task_id]
         _refresh_task_stats(task, args.max_attempts)
         while not task["passed"] and len(task["attempts"]) < args.max_attempts:
-            attempt_number = max(
-                (attempt["attempt"] for attempt in task["attempts"]),
-                default=0,
-            ) + 1
+            attempt_number = (
+                max(
+                    (attempt["attempt"] for attempt in task["attempts"]),
+                    default=0,
+                )
+                + 1
+            )
             record = _run_attempt(
                 args=args,
                 task_id=task_id,

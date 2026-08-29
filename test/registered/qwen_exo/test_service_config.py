@@ -193,13 +193,15 @@ def test_internal_budget_covers_reflection_retries_and_compaction():
         validate_values(values)
 
 
-def test_activation_editor_strength_is_the_only_managed_editor_setting():
+def test_experimental_trajectory_training_is_hidden_from_managed_config():
     values = default_values()
-    assert "qwen_exo_activation_editor_enabled" not in values
-    assert values["qwen_exo_activation_editor_strength"] == "2.0"
 
-    values["qwen_exo_activation_editor_strength"] = "8.0"
-    with pytest.raises(ServiceConfigError, match="必须是以下值之一"):
+    assert "qwen_exo_experimental_activation_training" not in values
+    assert "qwen_exo_activation_editor_strength" not in values
+    assert "qwen_exo_activation_editor_enabled" not in values
+
+    values["qwen_exo_experimental_activation_training"] = True
+    with pytest.raises(ServiceConfigError, match="未知配置项"):
         validate_values(values)
 
 

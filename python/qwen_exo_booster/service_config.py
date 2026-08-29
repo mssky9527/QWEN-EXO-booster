@@ -221,9 +221,9 @@ SERVICE_SETTINGS = (
         "max_running_requests",
         "capacity",
         "最大并发请求",
-        "作用：调度器同时处理的请求数上限。用途：限制并发防止拥塞排队。推荐值：64；单人使用时 1～8 响应更快。",
+        "作用：调度器同时处理的请求数上限。推荐值：10。",
         "integer",
-        64,
+        10,
         minimum=1,
         maximum=512,
         step=1,
@@ -997,20 +997,10 @@ SERVICE_SETTINGS = (
         choices=("off", "active"),
         choice_labels={"off": "关闭", "active": "开启"},
     ),
-    _setting(
-        "qwen_exo_activation_editor_strength",
-        "editor",
-        "微调强度",
-        "作用：选择当前联合轨迹编辑器的作用强度。标准、明显、最强依次增强编辑影响；不自动改档，由用户按实际任务效果选择。",
-        "string",
-        "2.0",
-        choices=("1.0", "2.0", "3.0"),
-        choice_labels={
-            "1.0": "标准（1×）",
-            "2.0": "明显（2×）",
-            "3.0": "最强（3×）",
-        },
-    ),
+    # Trajectory activation training is experimental and hidden while
+    # QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING is off.
+    # qwen_exo_activation_editor_strength is still supported by the runtime
+    # but intentionally omitted from the managed config UI by default.
 )
 
 _SETTINGS_BY_KEY = {setting.key: setting for setting in SERVICE_SETTINGS}
@@ -1125,6 +1115,9 @@ def _validate_runtime_contract(values: dict[str, Any]) -> None:
         adaptive_refresh=values["qwen_exo_enable_adaptive_refresh"],
         policy_data=values["qwen_exo_enable_policy_data"],
         score_bias=values["qwen_exo_score_bias_mode"] != "off",
+        activation_training=bool(
+            values.get("qwen_exo_experimental_activation_training", False)
+        ),
     )
     kwargs = {
         setting.key.removeprefix("qwen_exo_"): values[setting.key]

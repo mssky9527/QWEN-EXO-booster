@@ -13,6 +13,8 @@ from qwen_exo_booster.reflection_memory import (
     ReflectionMemoryCandidate,
     ReflectionMemoryService,
     ReflectionMemoryStore,
+    ReflectionSourceSnapshot,
+    ReflectionSourceStore,
     _reflection_task_category,
 )
 from qwen_exo_booster.telemetry import TelemetryStore
@@ -475,6 +477,20 @@ def test_reflection_update_must_target_a_qk_candidate():
         )
 
 
+def test_reflection_field_tag_is_not_misread_as_tool_name():
+    body = _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields())
+    malformed = body.replace(
+        '<tool_call name="save_reflection_memory">',
+        '<tool_call name="memory_action">',
+        1,
+    )
+
+    parsed = ReflectionMemoryService.parse_tool_call(malformed)
+
+    assert parsed is not None
+    assert parsed["memory_action"] == "insert"
+
+
 def test_reflection_generation_caps_reasoning_before_tool_phase(tmp_path):
     runner = _SequencedReflectionRunner(
         (
@@ -513,6 +529,44 @@ def test_reflection_generation_caps_reasoning_before_tool_phase(tmp_path):
     assert runner.sampling_params[0]["stop_token_ids"] == [999]
     assert "</think>" in runner.prompts[1]
     assert result.completion_tokens == 544
+    assert ReflectionMemoryService.parse_tool_call(result.text) is not None
+
+
+def test_reflection_reserves_three_quarters_for_large_tool_payload(tmp_path):
+    runner = _SequencedReflectionRunner(
+        (
+            ("<think>分析。", 2047, {"type": "length"}),
+            (
+                _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields()),
+                1024,
+                {"type": "stop"},
+            ),
+        )
+    )
+    service = ReflectionMemoryService(
+        runner,
+        _CharacterTokenizer(),
+        TelemetryStore(tmp_path / "trace.jsonl"),
+        model_fingerprint="model",
+        mode="active",
+        max_attempts=1,
+        max_output_tokens=8192,
+        max_reasoning_tokens=3072,
+        reasoning_end_token_id=999,
+        retrieve_similar=lambda _parent_id, _query: (),
+    )
+
+    result = asyncio.run(
+        service._run(
+            parent_id="reflection-parent",
+            source_digest="source-digest",
+            prompt="反思提示：",
+            attempt=1,
+        )
+    )
+
+    assert runner.jobs[0].token_budget == 2047
+    assert runner.jobs[1].token_budget == 6144
     assert ReflectionMemoryService.parse_tool_call(result.text) is not None
 
 
@@ -776,6 +830,138 @@ def test_reflection_generation_fails_closed_when_qk_retrieval_fails(tmp_path):
     assert result is None
     assert runner.prompts == []
     assert published == []
+
+
+def test_reflection_source_store_persists_trajectory_and_verifier_feedback(tmp_path):
+    snapshot = ReflectionSourceSnapshot(
+        source_digest="source-persisted",
+        trajectory_id="resp-persisted",
+        conversation_key="conversation-persisted",
+        original_task="Fix the failed GraphQL stream",
+        trajectory_history=(
+            {
+                "kind": "tool_observation",
+                "tool_name": "verifier",
+                "content": "17/17 checks passed",
+            },
+        ),
+        capsule_history=({"status": "complete"},),
+        verifier_feedback="Hidden verifier: 4 F2P failures remain",
+        source_event_count=1,
+        source_token_count=512,
+        source_audit={"source_tokens": 128},
+        captured_at=1.0,
+    )
+    path = tmp_path / "reflection-sources.sqlite3"
+
+    ReflectionSourceStore(path).save(snapshot)
+    reopened = ReflectionSourceStore(path)
+    restored = reopened.get(snapshot.source_digest)
+
+    assert restored == snapshot
+    assert reopened.metadata()[snapshot.source_digest] == {
+        "source_digest": snapshot.source_digest,
+        "trajectory_id": snapshot.trajectory_id,
+        "conversation_key": snapshot.conversation_key,
+        "captured_at": 1.0,
+        "supersedes_source_digest": None,
+        "source_event_count": 1,
+        "source_token_count": 512,
+        "trajectory_row_count": 1,
+        "capsule_count": 1,
+        "verifier_feedback_present": True,
+    }
+
+
+def test_regeneration_persists_feedback_and_replaces_required_target(tmp_path):
+    document_path = "reflection-memory/associated.md"
+    target = ReflectionMemoryCandidate(
+        document_path=document_path,
+        document_sha256="a" * 64,
+        title="关联反思",
+        content="旧的反思内容",
+        tensor_score=0.0,
+    )
+    fields = _fields(
+        memory_action="update",
+        target_document_path=document_path,
+        merge_document_paths=json.dumps([document_path]),
+    )
+    runner = _ReflectionRunner(_tool_call(REFLECTION_MEMORY_TOOL_NAME, fields))
+    source_store = ReflectionSourceStore(tmp_path / "reflection-sources.sqlite3")
+
+    async def retrieve(_parent_id, _query):
+        return ()
+
+    async def publish(reflection):
+        return {
+            "document_path": document_path,
+            "document_sha256": "b" * 64,
+            "native_source_digest": "bank-after",
+            "hot_updated": True,
+            "restart_required": False,
+            "publication_status": "published",
+        }
+
+    service = ReflectionMemoryService(
+        runner,
+        _CharacterTokenizer(),
+        TelemetryStore(tmp_path / "trace.jsonl"),
+        model_fingerprint="model",
+        mode="active",
+        max_attempts=1,
+        source_store=source_store,
+        publish=publish,
+        retrieve_similar=retrieve,
+    )
+    feedback = "Hidden verifier found four F2P failures after the agent timeout."
+
+    reflection = asyncio.run(
+        service.reflect(
+            trajectory_id="resp-associated",
+            conversation_key="conversation-associated",
+            original_task="Repair the GraphQL stream",
+            tool_ledger=(),
+            trajectory_history=(
+                {"kind": "assistant_trajectory", "content": "implemented parser"},
+            ),
+            capsule_history=(),
+            source_token_count=512,
+            allow_without_tool_events=True,
+            verifier_feedback=feedback,
+            required_update_target=target,
+            supersedes_source_digest="source-before",
+        )
+    )
+
+    assert reflection is not None
+    assert reflection.memory_action == "update"
+    assert reflection.document_path == document_path
+    assert feedback in runner.prompts[0]
+    captured = source_store.get(reflection.source_digest)
+    assert captured is not None
+    assert captured.verifier_feedback == feedback
+    assert captured.supersedes_source_digest == "source-before"
+
+
+def test_regeneration_rejects_inserting_a_second_memory():
+    parsed = ReflectionMemoryService.parse_tool_call(
+        _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields())
+    )
+    target = ReflectionMemoryCandidate(
+        document_path="reflection-memory/associated.md",
+        document_sha256="a" * 64,
+        title="关联反思",
+        content="旧的反思内容",
+        tensor_score=0.0,
+    )
+
+    with pytest.raises(ValueError, match="must update"):
+        ReflectionMemoryService._validate_memory_action(
+            parsed,
+            (target,),
+            required_update_target=target,
+        )
 
 
 def test_reflection_store_replaces_records_for_the_same_document(tmp_path):

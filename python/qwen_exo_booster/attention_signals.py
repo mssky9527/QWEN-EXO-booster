@@ -427,17 +427,14 @@ class AttentionSignalTracker:
             ).reshape(*value.shape[:-1], self.sketch_dimensions)
         return torch.nn.functional.normalize(compressed.float(), dim=-1)
 
-    def observe_decode_slots(
+    def _observe_decode_vectors(
         self,
-        q: torch.Tensor,
+        current: torch.Tensor,
         request_slots: torch.Tensor,
         row_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Observe decode Q with graph-resident state keyed by request-pool slot."""
-
-        state = self._ensure_decode_slots(q.device)
-        q_view = q.reshape(-1, self.num_heads, self.head_dim)
-        row_count = q_view.shape[0]
+        state = self._ensure_decode_slots(current.device)
+        row_count = current.shape[0]
         raw_slots = request_slots[:row_count].long()
         rows_enabled = row_mask[:row_count].bool()
         valid_slots = (raw_slots >= 0) & (raw_slots < self.max_requests)
@@ -447,8 +444,6 @@ class AttentionSignalTracker:
         dummy_slot = torch.full_like(safe_slots, self.max_requests)
         slots = torch.where(active, safe_slots, dummy_slot)
 
-        current = q_view.mean(dim=1, dtype=torch.float32)
-        current = self._reduce(current)
         previous = state.previous_q.index_select(0, slots)
         previous_valid = state.previous_valid.index_select(0, slots)
         memory_anchor = state.memory_anchor.index_select(0, slots)
@@ -523,6 +518,58 @@ class AttentionSignalTracker:
             "qwen_exo_q_sketch": q_sketches,
             "qwen_exo_k_sketch": k_sketches,
         }
+
+    def stage_speculative_q(self, q: torch.Tensor) -> torch.Tensor:
+        q_view = q.reshape(-1, self.num_heads, self.head_dim)
+        return self._reduce(q_view.mean(dim=1, dtype=torch.float32))
+
+    def observe_accept_q(
+        self,
+        q_rows: torch.Tensor,
+        request_slots: torch.Tensor,
+        row_mask: torch.Tensor,
+        num_accept_tokens: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Commit verify Q rows in accepted-token order; rejected rows stay inert."""
+
+        if q_rows.ndim != 3 or q_rows.shape[-1] != self.head_dim:
+            raise ValueError(
+                "Speculative Q rows must have shape [batch, stride, head_dim]"
+            )
+        batch_size = min(
+            int(q_rows.shape[0]),
+            int(request_slots.numel()),
+            int(row_mask.numel()),
+            int(num_accept_tokens.numel()),
+        )
+        if batch_size < 1:
+            return {}
+        q_rows = q_rows[:batch_size]
+        stride = int(q_rows.shape[1])
+        counts = num_accept_tokens[:batch_size].to(q_rows.device)
+        enabled = row_mask[:batch_size].to(q_rows.device).bool()
+        values: dict[str, list[torch.Tensor]] = {}
+        for step in range(stride):
+            step_values = self._observe_decode_vectors(
+                q_rows[:, step],
+                request_slots,
+                enabled & (counts > step),
+            )
+            for key, value in step_values.items():
+                values.setdefault(key, []).append(value)
+        return {key: torch.stack(rows, dim=1) for key, rows in values.items()}
+
+    def observe_decode_slots(
+        self,
+        q: torch.Tensor,
+        request_slots: torch.Tensor,
+        row_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Observe decode Q with graph-resident state keyed by request-pool slot."""
+
+        return self._observe_decode_vectors(
+            self.stage_speculative_q(q), request_slots, row_mask
+        )
 
     @staticmethod
     def _masked_top_mean(

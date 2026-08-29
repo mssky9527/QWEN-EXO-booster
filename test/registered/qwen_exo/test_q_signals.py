@@ -16,6 +16,7 @@ from qwen_exo_booster.native_state_bank import (
     _page_path,
     _quantize_fp8,
 )
+from qwen_exo_booster.memory_span import parse_private_memory_span
 from qwen_exo_booster.policy_data import PolicyDataRepository
 from qwen_exo_booster.pipeline import MemoryPipeline
 from qwen_exo_booster.tensor_bank import TensorBank
@@ -117,25 +118,87 @@ def test_q_drift_and_memory_key_energy_follow_request_identity():
     assert second["qwen_exo_memory_energy"][0] == 0.5
 
 
+def test_speculative_q_commits_only_accept_tokens_in_order():
+    tracker = AttentionSignalTracker(
+        num_heads=1,
+        num_kv_heads=1,
+        head_dim=2,
+        max_requests=4,
+    )
+    metadata = AttentionBatchMetadata(
+        is_decode=False,
+        is_extend=True,
+        contains_last_prefill_chunk=True,
+        rids=("request-1", "request-2"),
+        observe_mask=(True, True),
+        memory_spans=(None, None),
+        final_prefill_mask=(True, True),
+    )
+    slots = torch.tensor([1, 2], dtype=torch.long)
+    tracker.prepare_decode_slots(metadata, slots)
+    q_rows = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]],
+            [[1.0, 1.0], [0.0, 1.0], [1.0, 0.0]],
+        ]
+    )
+
+    result = tracker.observe_accept_q(
+        q_rows,
+        slots,
+        torch.tensor([True, True]),
+        torch.tensor([2, 0]),
+    )
+
+    assert result["qwen_exo_q_norm"].shape == (2, 3)
+    assert torch.isfinite(result["qwen_exo_q_norm"][0, :2]).all()
+    assert torch.isnan(result["qwen_exo_q_norm"][0, 2])
+    assert torch.isnan(result["qwen_exo_q_norm"][1]).all()
+    assert torch.isnan(result["qwen_exo_q_drift"][0, 0])
+    assert result["qwen_exo_q_drift"][0, 1] == 1.0
+    state = tracker._decode_slots
+    assert state is not None
+    assert state.history_count[1] == 2
+    assert state.history_count[2] == 0
+    assert torch.equal(state.previous_q[1], torch.tensor([0.0, 1.0]))
+
+
 def test_native_bank_keys_register_memory_energy_without_prefix_reprefill():
     tracker = AttentionSignalTracker(num_heads=1, num_kv_heads=1, head_dim=2)
-    tracker.register_memory_keys(
-        "qwen-exo-native:prefix", torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+    native_key = f"qwen-exo-native:{'a' * 64}"
+    tracker.register_memory_keys(native_key, torch.tensor([[1.0, 0.0], [1.0, 0.0]]))
+    span = parse_private_memory_span(
+        {
+            "qwen_exo_kind": "user",
+            "qwen_exo_memory_start": 0,
+            "qwen_exo_memory_length": 2,
+            "qwen_exo_memory_key": native_key,
+        },
+        request_id="request-native",
+        prompt_tokens=3,
     )
-    decode = AttentionBatchMetadata(
-        is_decode=True,
-        is_extend=False,
+    metadata = AttentionBatchMetadata(
+        is_decode=False,
+        is_extend=True,
         contains_last_prefill_chunk=True,
         rids=("request-native",),
         observe_mask=(True,),
-        memory_spans=((0, 2, "qwen-exo-native:prefix"),),
+        memory_spans=(span,),
+        final_prefill_mask=(True,),
+        extend_lens=(1,),
+        prefix_lens=(2,),
+    )
+    request_slots = torch.tensor([1])
+    tracker.prepare_decode_slots(metadata, request_slots)
+
+    result = tracker.observe_accept_q(
+        torch.tensor([[[1.0, 0.0]]]),
+        request_slots,
+        torch.tensor([True]),
+        torch.tensor([1]),
     )
 
-    result = tracker.observe(
-        torch.tensor([[1.0, 0.0]]), torch.tensor([[0.0, 1.0]]), decode
-    )
-
-    assert result["qwen_exo_memory_energy"][0] == 1.0
+    assert result["qwen_exo_memory_energy"][0, 0] == 1.0
 
 
 def test_tp_reduction_synchronizes_rank_local_q_and_k_sketches():

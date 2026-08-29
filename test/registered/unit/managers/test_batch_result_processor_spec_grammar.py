@@ -12,6 +12,7 @@ import torch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+    _customized_values_for_accept,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -70,6 +71,42 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         output_streamer=SimpleNamespace(),
         abort_request=lambda *a, **k: None,
     )
+
+
+class TestSpecCustomizedInfo(CustomTestCase):
+    def test_qwen_exo_values_align_to_num_accept_tokens(self):
+        per_token = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        scalar = torch.tensor([0.25])
+
+        self.assertEqual(
+            _customized_values_for_accept(
+                "qwen_exo_q_norm",
+                per_token,
+                0,
+                num_accept_tokens=2,
+                speculative_num_draft_tokens=4,
+            ),
+            (1.0, 2.0),
+        )
+        self.assertEqual(
+            _customized_values_for_accept(
+                "qwen_exo_score_bias_phase",
+                scalar,
+                0,
+                num_accept_tokens=3,
+                speculative_num_draft_tokens=4,
+            ),
+            (0.25, 0.25, 0.25),
+        )
+        ordinary = _customized_values_for_accept(
+            "ordinary_info",
+            scalar,
+            0,
+            num_accept_tokens=3,
+            speculative_num_draft_tokens=4,
+        )
+        self.assertEqual(len(ordinary), 1)
+        self.assertEqual(ordinary[0], torch.tensor(0.25))
 
 
 def _make_req(terminate_after: int) -> Req:

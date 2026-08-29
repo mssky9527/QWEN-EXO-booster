@@ -44,7 +44,7 @@ export const NAV_ITEMS = [
   { id: "trace", label: "召回轨迹", icon: Activity },
   { id: "knowledge", label: "知识库", icon: BookOpen },
   { id: "reflection", label: "反思记忆", icon: BrainCircuit },
-  { id: "editor", label: "轨迹微调", icon: SlidersHorizontal },
+  { id: "editor", label: "轨迹微调", icon: SlidersHorizontal, experimental: true },
   { id: "catalog", label: "模型目录", icon: Boxes },
   { id: "api-keys", label: "API 密钥", icon: KeyRound },
   { id: "settings", label: "设置", icon: Settings },
@@ -64,7 +64,13 @@ export function AppShell({
   children: ReactNode;
 }) {
   const ready = status?.runtime_state === "ready";
-  const current = NAV_ITEMS.find((item) => item.id === view) || NAV_ITEMS[0];
+  const activationTrainingEnabled = Boolean(
+    status?.features?.activation_training,
+  );
+  const navItems = NAV_ITEMS.filter(
+    (item) => !("experimental" in item && item.experimental) || activationTrainingEnabled,
+  );
+  const current = navItems.find((item) => item.id === view) || navItems[0];
   const { mode, setMode, dark } = useTheme();
   const { language, preference, setPreference, t } = useI18n();
 
@@ -85,7 +91,7 @@ export function AppShell({
 
         <nav className="flex-1 space-y-1 px-3 py-4" aria-label={t("主导航")}>
           <div className="eyebrow mb-3 px-3">{t("工作区")}</div>
-          {NAV_ITEMS.map((item) => {
+          {navItems.map((item) => {
             const Icon = item.icon;
             return (
               <button
@@ -166,7 +172,7 @@ export function AppShell({
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="start" className="w-52">
-                {NAV_ITEMS.map((item) => (
+                {navItems.map((item) => (
                   <DropdownMenuItem
                     key={item.id}
                     onSelect={() => onView(item.id)}

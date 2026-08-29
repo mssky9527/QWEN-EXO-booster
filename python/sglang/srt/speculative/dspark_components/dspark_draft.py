@@ -153,7 +153,7 @@ def resolve_greedy_mask(
 ) -> torch.Tensor:
     if sampling_info is None:
         return torch.ones(bs, dtype=torch.bool, device=device)
-    return (sampling_info.top_ks <= 1).view(-1)
+    return (sampling_info.top_ks.view(-1)[:bs] <= 1).to(device=device)
 
 
 def sample_draft_block(

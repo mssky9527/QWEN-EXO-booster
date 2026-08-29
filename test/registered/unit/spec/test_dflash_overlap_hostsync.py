@@ -34,6 +34,59 @@ def _compact_lens_host(seq_lens, window, page):
     return out
 
 
+class TestResolveGreedyMaskBatchShape(CustomTestCase):
+    def test_truncates_sampling_info_to_current_batch(self):
+        from sglang.srt.speculative.dspark_components.dspark_draft import (
+            resolve_greedy_mask,
+        )
+
+        sampling_info = SimpleNamespace(top_ks=torch.tensor([[1], [8]]))
+        actual = resolve_greedy_mask(
+            bs=1, sampling_info=sampling_info, device=torch.device("cpu")
+        )
+
+        torch.testing.assert_close(actual, torch.tensor([True]))
+
+    def test_selector_sampler_stages_only_current_batch(self):
+        from sglang.srt.speculative.dflash_worker_v2 import _SelectorDraftSampler
+
+        sampler = _SelectorDraftSampler(
+            draft_model=SimpleNamespace(candidate_selector=SimpleNamespace(top_k=4)),
+            block_size=3,
+            max_bs=2,
+            device=torch.device("cpu"),
+        )
+        sampling_info = SimpleNamespace(
+            top_ks=torch.tensor([[8], [1]]),
+            temperatures=torch.tensor([[0.5], [0.7]]),
+        )
+
+        sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
+
+        torch.testing.assert_close(sampler.greedy_mask, torch.tensor([False, True]))
+        torch.testing.assert_close(sampler.temperatures, torch.tensor([0.5, 1.0]))
+
+    def test_selector_sampler_rejects_batch_beyond_graph_capacity(self):
+        from sglang.srt.speculative.dflash_worker_v2 import _SelectorDraftSampler
+
+        sampler = _SelectorDraftSampler(
+            draft_model=SimpleNamespace(candidate_selector=SimpleNamespace(top_k=4)),
+            block_size=3,
+            max_bs=1,
+            device=torch.device("cpu"),
+        )
+        sampling_info = SimpleNamespace(
+            top_ks=torch.tensor([[8], [1]]),
+            temperatures=torch.tensor([[0.5], [0.7]]),
+        )
+
+        staged = sampler.stage_sampling_params(bs=2, sampling_info=sampling_info)
+
+        self.assertFalse(staged)
+        torch.testing.assert_close(sampler.greedy_mask, torch.tensor([True]))
+        torch.testing.assert_close(sampler.temperatures, torch.tensor([1.0]))
+
+
 class TestCompactSeqLensHostBound(CustomTestCase):
     def test_upper_bound_of_exact(self):
         g = torch.Generator().manual_seed(0)

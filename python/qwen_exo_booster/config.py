@@ -64,6 +64,7 @@ class QwenExoFeatureFlags:
     adaptive_refresh: bool
     policy_data: bool = True
     score_bias: bool = False
+    activation_training: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +83,7 @@ class QwenExoConfig:
     dtype: str = "auto"
     quantization: str = "none"
     kv_cache_dtype: str = "auto"
-    max_running_requests: int = 4
+    max_running_requests: int = 10
     context_length: int = 102400
     policy_data_directory: Path | None = None
     cognition_directory: Path | None = None
@@ -506,9 +507,14 @@ class QwenExoConfig:
                     getattr(server_args, "qwen_exo_enable_policy_data", False)
                 ),
                 score_bias=score_bias_enabled,
+                activation_training=bool(
+                    getattr(
+                        server_args, "qwen_exo_experimental_activation_training", False
+                    )
+                ),
             ),
             max_running_requests=int(
-                getattr(server_args, "max_running_requests", 4) or 4
+                getattr(server_args, "max_running_requests", 10) or 10
             ),
             context_length=int(getattr(server_args, "context_length", 102400)),
             model_path=str(server_args.model_path),

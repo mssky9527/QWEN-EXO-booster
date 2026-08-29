@@ -79,6 +79,9 @@ from qwen_exo_booster.reflection_memory import (
     ReflectionMemoryCandidate,
     ReflectionMemoryService,
     ReflectionMemoryStore,
+    ReflectionSourceSnapshot,
+    ReflectionSourceStore,
+    reflection_source_digest,
 )
 from qwen_exo_booster.refresh import (
     RefreshRecord,
@@ -100,6 +103,13 @@ from qwen_exo_booster.score_bias import (
 from qwen_exo_booster.tensor_bank import TensorBank
 
 logger = logging.getLogger(__name__)
+
+
+def _query_probe_timeout_seconds(tokenizer_manager: Any) -> float:
+    server_args = getattr(tokenizer_manager, "server_args", None)
+    algorithm = str(getattr(server_args, "speculative_algorithm", "") or "").upper()
+    return 120.0 if algorithm == "DFLASH" else 30.0
+
 
 _SELF_QUESTION_STOP_WORDS = frozenset(
     {
@@ -305,6 +315,9 @@ class QwenExoRuntime:
         self.reflection_memory_store = ReflectionMemoryStore(
             config.state_directory / "reflection-memory.json"
         )
+        self.reflection_source_store = ReflectionSourceStore(
+            config.state_directory / "reflection-sources.sqlite3"
+        )
         self.reference_judge: ReferenceJudge | None = None
         self.capsules: ExecutionCapsuleService | None = None
         self.refresh_service: SelfAskRefreshService | None = None
@@ -360,6 +373,21 @@ class QwenExoRuntime:
             "stage": "idle",
             "progress": 0,
             "message": "尚未开始整理",
+            "queued_at": None,
+            "started_at": None,
+            "updated_at": None,
+            "finished_at": None,
+            "details": {},
+            "result": None,
+            "error": None,
+        }
+        self._reflection_memory_regeneration_task: asyncio.Task[None] | None = None
+        self._reflection_memory_regeneration_state: dict[str, Any] = {
+            "job_id": None,
+            "status": "idle",
+            "stage": "idle",
+            "progress": 0,
+            "message": "尚未开始重新反思",
             "queued_at": None,
             "started_at": None,
             "updated_at": None,
@@ -741,6 +769,9 @@ class QwenExoRuntime:
                             tokenizer,
                             self.telemetry,
                             max_prompt_tokens=self.config.max_internal_tokens,
+                            timeout_seconds=_query_probe_timeout_seconds(
+                                self.tokenizer_manager
+                            ),
                             cognition_token_ids=self.tensor_bank.cognition_token_ids(),
                             query_head_count=query_head_count,
                             head_dim=query_head_dim,
@@ -802,6 +833,7 @@ class QwenExoRuntime:
                         max_reasoning_tokens=self.config.max_reasoning_tokens,
                         reasoning_end_token_id=self._reasoning_end_token_id,
                         store=self.reflection_memory_store,
+                        source_store=self.reflection_source_store,
                         publish=self._publish_reflection_memory,
                         retrieve_similar=self._retrieve_reflection_memory_candidates,
                     )
@@ -886,6 +918,11 @@ class QwenExoRuntime:
                 organization_task.cancel()
                 await asyncio.gather(organization_task, return_exceptions=True)
             self._reflection_memory_organization_task = None
+            regeneration_task = self._reflection_memory_regeneration_task
+            if regeneration_task is not None and not regeneration_task.done():
+                regeneration_task.cancel()
+                await asyncio.gather(regeneration_task, return_exceptions=True)
+            self._reflection_memory_regeneration_task = None
             reflection_memory_tasks = tuple(self._reflection_memory_tasks.values())
             for task in reflection_memory_tasks:
                 task.cancel()
@@ -3425,9 +3462,7 @@ class QwenExoRuntime:
             item = (
                 raw_item
                 if isinstance(raw_item, dict)
-                else raw_item.model_dump()
-                if hasattr(raw_item, "model_dump")
-                else None
+                else raw_item.model_dump() if hasattr(raw_item, "model_dump") else None
             )
             if isinstance(item, dict):
                 items.append(item)
@@ -4297,6 +4332,13 @@ class QwenExoRuntime:
         )
 
     def activation_editor_request(self, raw_custom: object = None) -> dict[str, object]:
+        if not self.config.feature_flags.activation_training:
+            return {
+                "spec": None,
+                "cache_identity": stable_digest(
+                    "activation-editor-v1", "experimental-disabled"
+                ),
+            }
         explicit = parse_activation_editor_spec(raw_custom)
         active_spec = None
         try:
@@ -4881,19 +4923,11 @@ class QwenExoRuntime:
             record.public_dict()
             for record in self.capsule_store.lineage(request_id, max_turns=128)
         )
-        source_digest = stable_digest(
-            "reflection-memory-source-v2",
-            conversation_key,
-            original_task,
-            json.dumps(
-                trajectory_history,
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            ),
-            json.dumps(
-                capsule_history, ensure_ascii=False, sort_keys=True, default=str
-            ),
+        source_digest = reflection_source_digest(
+            conversation_key=conversation_key,
+            original_task=original_task,
+            trajectory_history=trajectory_history,
+            capsule_history=capsule_history,
         )
         if self._reflection_memory_sources.get(conversation_key) == source_digest:
             return
@@ -5375,6 +5409,266 @@ class QwenExoRuntime:
         )
         return candidates
 
+    def reflection_memory_regeneration_status(self) -> dict[str, Any]:
+        return json.loads(
+            json.dumps(
+                self._reflection_memory_regeneration_state,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+
+    def _reflection_regeneration_target(
+        self, record: dict[str, Any], expected_document_sha256: str
+    ) -> ReflectionMemoryCandidate:
+        document_path = str(record.get("document_path") or "")
+        record_sha256 = str(record.get("document_sha256") or "")
+        if not document_path or not record_sha256:
+            raise RuntimeError("Reflection memory has no published document")
+        if str(expected_document_sha256) != record_sha256:
+            raise RuntimeError("Reflection memory changed; refresh before regenerating")
+        document = next(
+            (
+                item
+                for item in self.knowledge.snapshot.documents
+                if item.relative_path == document_path
+            ),
+            None,
+        )
+        if document is None or document.sha256 != record_sha256:
+            raise RuntimeError("Associated Reflection memory document is stale")
+        return ReflectionMemoryCandidate(
+            document_path=document.relative_path,
+            document_sha256=document.sha256,
+            title=str(document.title or record.get("title") or document.relative_path),
+            content=document.normalized_content,
+            tensor_score=0.0,
+        )
+
+    def start_reflection_memory_regeneration(
+        self,
+        source_digest: str,
+        *,
+        verifier_feedback: str,
+        expected_document_sha256: str,
+    ) -> dict[str, Any]:
+        if (
+            self.reflection_memory_service is None
+            or self.tensor_bank is None
+            or self.query_probe is None
+        ):
+            raise RuntimeError("Reflection memory regeneration is unavailable")
+        current = getattr(self, "_reflection_memory_regeneration_task", None)
+        if current is not None and not current.done():
+            raise RuntimeError("Reflection memory regeneration is already running")
+        organization = getattr(self, "_reflection_memory_organization_task", None)
+        if organization is not None and not organization.done():
+            raise RuntimeError("Reflection memory organization is already running")
+        feedback = str(verifier_feedback).strip()
+        if not feedback:
+            raise ValueError("Verifier feedback is required")
+        if len(feedback) > 131_072:
+            raise ValueError("Verifier feedback exceeds 131072 characters")
+        record = self.reflection_memory_store.get(source_digest)
+        snapshot = self.reflection_source_store.get(source_digest)
+        if record is None or snapshot is None:
+            raise KeyError(source_digest)
+        target = self._reflection_regeneration_target(record, expected_document_sha256)
+        queued_at = time.time()
+        job_id = (
+            "reflection-regeneration-"
+            + stable_digest(time.time_ns(), source_digest, target.document_sha256)[:20]
+        )
+        self._reflection_memory_regeneration_state = {
+            "job_id": job_id,
+            "status": "queued",
+            "stage": "queued",
+            "progress": 0,
+            "message": "重新反思任务已进入后台队列",
+            "queued_at": queued_at,
+            "started_at": None,
+            "updated_at": queued_at,
+            "finished_at": None,
+            "details": {
+                "source_digest": source_digest,
+                "trajectory_id": snapshot.trajectory_id,
+                "document_path": target.document_path,
+                "verifier_feedback_chars": len(feedback),
+            },
+            "result": None,
+            "error": None,
+        }
+        task = asyncio.create_task(
+            self._run_reflection_memory_regeneration(
+                job_id=job_id,
+                snapshot=snapshot,
+                target=target,
+                verifier_feedback=feedback,
+            ),
+            name=job_id,
+        )
+        self._reflection_memory_regeneration_task = task
+        self.telemetry.emit(
+            job_id,
+            "reflection_memory.regeneration.job_queued",
+            {
+                "job_id": job_id,
+                "source_digest": source_digest,
+                "trajectory_id": snapshot.trajectory_id,
+                "document_path": target.document_path,
+                "verifier_feedback_chars": len(feedback),
+                "verifier_feedback_digest": stable_digest(feedback),
+            },
+        )
+        return self.reflection_memory_regeneration_status()
+
+    def _update_reflection_memory_regeneration(
+        self, job_id: str, **changes: Any
+    ) -> None:
+        current = self._reflection_memory_regeneration_state
+        if current.get("job_id") != job_id:
+            return
+        next_state = dict(current)
+        details = changes.pop("details", None)
+        next_state.update(changes)
+        if "progress" in changes:
+            next_state["progress"] = max(
+                int(current.get("progress", 0)),
+                min(100, max(0, int(changes["progress"]))),
+            )
+        if details is not None:
+            next_state["details"] = {
+                **dict(current.get("details") or {}),
+                **dict(details),
+            }
+        next_state["updated_at"] = time.time()
+        self._reflection_memory_regeneration_state = next_state
+        self.telemetry.emit(
+            job_id,
+            "reflection_memory.regeneration.job_progress",
+            {
+                "job_id": job_id,
+                "status": next_state.get("status"),
+                "stage": next_state.get("stage"),
+                "progress": next_state.get("progress"),
+                "message": next_state.get("message"),
+                "details": next_state.get("details"),
+            },
+        )
+
+    async def _run_reflection_memory_regeneration(
+        self,
+        *,
+        job_id: str,
+        snapshot: ReflectionSourceSnapshot,
+        target: ReflectionMemoryCandidate,
+        verifier_feedback: str,
+    ) -> None:
+        self._update_reflection_memory_regeneration(
+            job_id,
+            status="running",
+            stage="loading_source",
+            progress=5,
+            message="正在读取关联轨迹与 verifier 反馈",
+            started_at=time.time(),
+        )
+
+        def report(stage: str) -> None:
+            progress_by_stage = {
+                "qk_retrieval": 20,
+                "model_review": 40,
+                "publishing": 82,
+            }
+            message_by_stage = {
+                "qk_retrieval": "正在检索相关 Reflection Memory",
+                "model_review": "模型正在根据轨迹与 verifier 反馈重新反思",
+                "publishing": "正在原子替换记忆并重建 Tensor Bank",
+            }
+            self._update_reflection_memory_regeneration(
+                job_id,
+                stage=stage,
+                progress=progress_by_stage[stage],
+                message=message_by_stage[stage],
+            )
+
+        tool_ledger = tuple(
+            {
+                "tool_name": str(row.get("tool_name") or ""),
+                "call_id": str(row.get("call_id") or ""),
+                "observation": str(row.get("content") or ""),
+            }
+            for row in snapshot.trajectory_history
+            if str(row.get("kind") or "") == "tool_observation"
+        )
+        try:
+            reflection = await self.reflection_memory_service.reflect(
+                trajectory_id=snapshot.trajectory_id,
+                conversation_key=snapshot.conversation_key,
+                original_task=snapshot.original_task,
+                tool_ledger=tool_ledger,
+                trajectory_history=snapshot.trajectory_history,
+                capsule_history=snapshot.capsule_history,
+                source_token_count=snapshot.source_token_count,
+                allow_without_tool_events=True,
+                verifier_feedback=verifier_feedback,
+                required_update_target=target,
+                supersedes_source_digest=snapshot.source_digest,
+                stage_callback=report,
+            )
+            if reflection is None or reflection.publication_status != "published":
+                raise RuntimeError("Model did not publish a replacement reflection")
+        except asyncio.CancelledError:
+            self._update_reflection_memory_regeneration(
+                job_id,
+                status="failed",
+                stage="failed",
+                message="服务停止，重新反思任务已中断",
+                error="cancelled",
+                finished_at=time.time(),
+            )
+            raise
+        except Exception as exc:
+            error = type(exc).__name__ + ": " + str(exc)[:500]
+            self._update_reflection_memory_regeneration(
+                job_id,
+                status="failed",
+                stage="failed",
+                message="重新反思失败，原记忆保持不变",
+                error=error,
+                finished_at=time.time(),
+            )
+            self.telemetry.emit(
+                job_id,
+                "reflection_memory.regeneration.job_failed",
+                {"job_id": job_id, "error": error},
+            )
+            return
+        result = {
+            "source_digest": reflection.source_digest,
+            "supersedes_source_digest": snapshot.source_digest,
+            "trajectory_id": reflection.trajectory_id,
+            "document_path": reflection.document_path,
+            "document_sha256": reflection.document_sha256,
+            "native_source_digest": reflection.native_source_digest,
+            "publication_status": reflection.publication_status,
+            "hot_updated": reflection.hot_updated,
+        }
+        self._update_reflection_memory_regeneration(
+            job_id,
+            status="succeeded",
+            stage="completed",
+            progress=100,
+            message="重新反思完成，关联记忆已替换",
+            result=result,
+            error=None,
+            finished_at=time.time(),
+        )
+        self.telemetry.emit(
+            job_id,
+            "reflection_memory.regeneration.job_completed",
+            {"job_id": job_id, "result": result},
+        )
+
     def reflection_memory_organization_status(self) -> dict[str, Any]:
         return json.loads(
             json.dumps(
@@ -5394,6 +5688,9 @@ class QwenExoRuntime:
         current = self._reflection_memory_organization_task
         if current is not None and not current.done():
             raise RuntimeError("Reflection memory organization is already running")
+        regeneration = getattr(self, "_reflection_memory_regeneration_task", None)
+        if regeneration is not None and not regeneration.done():
+            raise RuntimeError("Reflection memory regeneration is already running")
         queued_at = time.time()
         job_id = (
             "reflection-organization-"
@@ -6010,6 +6307,9 @@ class QwenExoRuntime:
                         tokenizer,
                         self.telemetry,
                         max_prompt_tokens=self.config.max_internal_tokens,
+                        timeout_seconds=_query_probe_timeout_seconds(
+                            self.tokenizer_manager
+                        ),
                         cognition_token_ids=self.tensor_bank.cognition_token_ids(),
                     )
                 if effective_category:
@@ -6076,7 +6376,25 @@ class QwenExoRuntime:
         return payload
 
     def reflection_memories(self) -> list[dict[str, Any]]:
-        return self.reflection_memory_store.list()
+        source_metadata = self.reflection_source_store.metadata()
+        records = self.reflection_memory_store.list()
+        for record in records:
+            metadata = source_metadata.get(str(record.get("source_digest") or ""))
+            record["source_available"] = metadata is not None
+            record["trajectory_source"] = (
+                dict(metadata) if metadata is not None else None
+            )
+        return records
+
+    def reflection_source(self, source_digest: str) -> dict[str, Any]:
+        record = self.reflection_memory_store.get(source_digest)
+        snapshot = self.reflection_source_store.get(source_digest)
+        if record is None or snapshot is None:
+            raise KeyError(source_digest)
+        return {
+            "reflection": record,
+            "source": snapshot.public_dict(include_content=True),
+        }
 
     def telemetry_events(
         self, request_id: str | None = None, *, limit: int = 256
