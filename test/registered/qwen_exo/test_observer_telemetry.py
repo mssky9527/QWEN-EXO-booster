@@ -276,6 +276,38 @@ def test_observer_state_is_bound_to_request_id(tmp_path):
     assert observer.state("a").ema_surprisal != observer.state("b").ema_surprisal
 
 
+def test_explicitly_disabled_thinking_cannot_trigger_observer(tmp_path):
+    observer = InFlightObserver(
+        TelemetryStore(tmp_path / "trace-no-think.jsonl"),
+        mode="active",
+        surprisal_window=2,
+        surprisal_threshold=0.0,
+        surprisal_margin=0.0,
+        q_drift_threshold=0.0,
+    )
+
+    result = observer.observe_generation_result(
+        "request-no-think",
+        {
+            "meta_info": {
+                "output_token_logprobs": [
+                    (-4.0, 1),
+                    (-4.0, 2),
+                    (-4.0, 3),
+                    (-4.0, 4),
+                ],
+                "qwen_exo_q_drift": [float("nan"), 0.9, 0.9, 0.9],
+            }
+        },
+        incremental_logprobs=True,
+        reasoning_end_token_id=999,
+        thinking_enabled=False,
+    )
+
+    assert not result.triggered
+    assert observer.state("request-no-think").in_reasoning is False
+
+
 def test_attention_q_drift_can_trigger_and_memory_energy_is_reported(tmp_path):
     store = TelemetryStore(tmp_path / "trace.jsonl")
     observer = InFlightObserver(

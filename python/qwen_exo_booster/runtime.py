@@ -2171,6 +2171,7 @@ class QwenExoRuntime:
         *,
         incremental_logprobs: bool = False,
         generation_index: int = 0,
+        thinking_enabled: bool | None = None,
     ) -> ObserverResult:
         self._record_generation_tokens(
             request_id,
@@ -2251,12 +2252,16 @@ class QwenExoRuntime:
                 },
             )
 
+        observer_reasoning_end_token_id = (
+            self._reasoning_end_token_id if thinking_enabled is not False else None
+        )
         observation = self.observer.observe_generation_result(
             request_id,
             result,
             incremental_logprobs=incremental_logprobs,
             generation_index=generation_index,
-            reasoning_end_token_id=self._reasoning_end_token_id,
+            reasoning_end_token_id=observer_reasoning_end_token_id,
+            thinking_enabled=thinking_enabled,
         )
         persistent_event = next(
             (

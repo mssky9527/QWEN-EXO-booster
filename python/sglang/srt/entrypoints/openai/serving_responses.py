@@ -1086,6 +1086,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         sampling_params,
                         context,
                         raw_request=raw_request,
+                        response_request=request,
                         priority=request.priority,
                         native_prefix_ids=native_prefix_ids,
                     )
@@ -3498,7 +3499,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 max(int(configured_max) - consumed_tokens, 1),
             )
         return self._copy_sampling_params(sampling_params, max_new_tokens=remaining)
-
     async def _generate_with_builtin_tools(
         self,
         request_id: str,
@@ -3507,6 +3507,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         sampling_params: Any,
         context: ConversationContext,
         raw_request: Optional[Request] = None,
+        response_request: ResponsesRequest | None = None,
         priority: Optional[int] = None,
         **kwargs,
     ) -> AsyncGenerator[Any, None]:
@@ -3518,6 +3519,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             and self.tokenizer_manager.server_args.incremental_streaming_output
         )
         native_prefix_ids = tuple(kwargs.get("native_prefix_ids") or ())
+        thinking_enabled = (
+            self._is_thinking_enabled_for_request(response_request)
+            if response_request is not None
+            else None
+        )
 
         while True:
             qwen_exo_runtime = (
@@ -3595,6 +3601,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 qwen_exo_runtime.reasoning_end_token_id
                 if qwen_exo_runtime is not None
                 and qwen_exo_runtime.think_context_enabled
+                and thinking_enabled is not False
                 and prompt_token_ids is not None
                 else None
             )
@@ -3685,6 +3692,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         res,
                         incremental_logprobs=incremental_logprobs,
                         generation_index=generation_index,
+                        thinking_enabled=thinking_enabled,
                     )
                 public_result = res
                 if reasoning_end_token_id is not None and (
@@ -3850,6 +3858,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         runtime_result,
                         incremental_logprobs=True,
                         generation_index=generation_index,
+                        thinking_enabled=thinking_enabled,
                     )
                     public_result = continuation_result
                     if isinstance(context, SimpleContext):

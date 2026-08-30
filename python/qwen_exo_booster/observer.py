@@ -385,11 +385,18 @@ class InFlightObserver:
         incremental_logprobs: bool = False,
         generation_index: int = 0,
         reasoning_end_token_id: int | None = None,
+        thinking_enabled: bool | None = None,
     ) -> ObserverResult:
         request_id = str(request_id)
-        state = self._states.setdefault(
-            request_id, ObserverRequestState(request_id=request_id)
-        )
+        state = self._states.get(request_id)
+        if state is None:
+            state = ObserverRequestState(
+                request_id=request_id,
+                in_reasoning=thinking_enabled is not False,
+            )
+            self._states[request_id] = state
+        elif thinking_enabled is False:
+            state.in_reasoning = False
         if state.generation_index != int(generation_index):
             state.generation_index = int(generation_index)
             state.processed_logprobs = 0
