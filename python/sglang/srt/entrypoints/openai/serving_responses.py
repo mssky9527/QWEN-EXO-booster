@@ -1287,6 +1287,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         except ValueError as e:
             return self.create_error_response(str(e))
 
+        finish_reason: Mapping[str, Any] | None = None
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = self._make_response_output_items_with_harmony(context)
@@ -1319,6 +1320,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
                 num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
+                raw_finish_reason = meta_info.get("finish_reason")
+                if isinstance(raw_finish_reason, Mapping):
+                    finish_reason = raw_finish_reason
             elif isinstance(final_res, dict) and (
                 final_res.get("prompt_token_ids") is not None
                 or final_res.get("output_ids") is not None
@@ -1363,14 +1367,18 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         request_metadata.final_usage_info = usage
 
+        response_status, incomplete_details = self._response_terminal_status(
+            finish_reason
+        )
         response = ResponsesResponse.from_request(
             request,
             sampling_params,
             model_name=model_name,
             created_time=created_time,
             output=output,
-            status="completed",
+            status=response_status,
             usage=usage,
+            incomplete_details=incomplete_details,
         )
 
         if request.store:
@@ -2137,7 +2145,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response_id)
                 assert stored_response is not None
-                if stored_response.status not in ("completed", "cancelled"):
+                if stored_response.status not in {
+                    "completed",
+                    "incomplete",
+                    "cancelled",
+                }:
                     stored_response.status = "failed"
                     stored_response.error = background_error
                     stored_response.metadata = {
@@ -3254,14 +3266,18 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         request_metadata.final_usage_info = usage
 
+        response_status, incomplete_details = self._response_terminal_status(
+            finish_reason
+        )
         final_response = ResponsesResponse.from_request(
             request,
             sampling_params,
             model_name=model_name,
             created_time=created_time,
             output=final_output_items,
-            status="completed",
+            status=response_status,
             usage=usage,
+            incomplete_details=incomplete_details,
         )
         if request.store:
             async with self.response_store_lock:
@@ -3284,13 +3300,22 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
 
-        yield _send_event(
-            openai_responses_types.ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=response_dict,
+        if response_status == "incomplete":
+            yield _send_event(
+                openai_responses_types.ResponseIncompleteEvent(
+                    type="response.incomplete",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
             )
-        )
+        else:
+            yield _send_event(
+                openai_responses_types.ResponseCompletedEvent(
+                    type="response.completed",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
+            )
 
     @staticmethod
     def _copy_sampling_params(sampling_params: Any, **updates: Any) -> Any:
@@ -3414,6 +3439,14 @@ class OpenAIServingResponses(OpenAIServingChat):
             ),
             detail=detail,
         )
+
+    @staticmethod
+    def _response_terminal_status(
+        finish_reason: Mapping[str, Any] | None,
+    ) -> tuple[str, dict[str, str] | None]:
+        if isinstance(finish_reason, Mapping) and finish_reason.get("type") == "length":
+            return "incomplete", {"reason": "max_output_tokens"}
+        return "completed", None
 
     def _reasoning_boundary_tokens(
         self,

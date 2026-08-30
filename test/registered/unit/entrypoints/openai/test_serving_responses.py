@@ -508,6 +508,44 @@ class FullResponseUsageTestCase(unittest.TestCase):
         self.assertEqual(response.usage.reasoning_tokens, 2)
         self.assertEqual(metadata.final_usage_info, response.usage)
 
+    def test_length_finish_returns_incomplete_response(self):
+        serving = make_serving()
+        context = SimpleContext()
+        context.last_output = {
+            "text": "partial output",
+            "meta_info": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "cached_tokens": 3,
+                "reasoning_tokens": 2,
+                "finish_reason": {"type": "length", "length": 7},
+            },
+        }
+        request = ResponsesRequest(
+            model="x", input="hello", request_id="resp_length", store=False
+        )
+        metadata = RequestResponseMetadata(request_id=request.request_id)
+
+        async def empty_generator():
+            for _ in ():
+                yield None
+
+        response = asyncio.run(
+            serving.responses_full_generator(
+                request,
+                sampling_params={},
+                result_generator=empty_generator(),
+                context=context,
+                model_name="x",
+                tokenizer=serving.tokenizer_manager.tokenizer,
+                request_metadata=metadata,
+                created_time=123,
+            )
+        )
+
+        self.assertEqual(response.status, "incomplete")
+        self.assertEqual(response.incomplete_details, {"reason": "max_output_tokens"})
+
 
 class MultimodalRequestTestCase(unittest.TestCase):
     def test_multimodal_create_responses_sends_text_and_media_to_engine(self):

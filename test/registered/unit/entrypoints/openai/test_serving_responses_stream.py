@@ -45,7 +45,9 @@ class _StreamFixture:
         return asyncio.run(collect())
 
 
-def _engine_chunk(text, completion_tokens, *, finish=False):
+def _engine_chunk(text, completion_tokens, *, finish=False, finish_reason=None):
+    if finish_reason is None and finish:
+        finish_reason = {"type": "stop"}
     return {
         "text": text,
         "meta_info": {
@@ -54,7 +56,7 @@ def _engine_chunk(text, completion_tokens, *, finish=False):
             "completion_tokens": completion_tokens,
             "cached_tokens": 0,
             "reasoning_tokens": 0,
-            "finish_reason": {"type": "stop"} if finish else None,
+            "finish_reason": finish_reason,
         },
     }
 
@@ -91,6 +93,32 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
 
         seqs = [p["sequence_number"] for p in event_payloads(events)]
         self.assertEqual(seqs, list(range(len(seqs))))
+
+    def test_length_finish_emits_incomplete_event(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+
+        events = _StreamFixture(serving, request).run(
+            [
+                _engine_chunk(
+                    "partial",
+                    16,
+                    finish_reason={"type": "length", "length": 16},
+                )
+            ]
+        )
+        payloads = event_payloads(events)
+        terminal = payloads[-1]
+
+        self.assertEqual(event_types(events)[-1], "response.incomplete")
+        self.assertNotIn("response.completed", event_types(events))
+        self.assertEqual(terminal["response"]["status"], "incomplete")
+        self.assertEqual(
+            terminal["response"]["incomplete_details"],
+            {"reason": "max_output_tokens"},
+        )
 
     def test_reasoning_effort_none_streams_with_null_response_effort(self):
         serving = make_serving()
