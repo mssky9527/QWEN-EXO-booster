@@ -29,20 +29,36 @@ class FakeTokenizer:
 
 
 class FakeRunner:
-    def __init__(self, text=None, finish_reason=None):
+    def __init__(
+        self,
+        text=None,
+        finish_reason=None,
+        *,
+        fast_text=None,
+        fallback_text=None,
+    ):
         self.text = text or json.dumps(VALID_CAPSULE)
+        self.fast_text = fast_text
+        self.fallback_text = fallback_text
         self.finish_reason = finish_reason or {"type": "stop"}
         self.calls = 0
+        self.sampling_params = []
         self.max_fanout = 8
 
     async def run_batch(self, jobs, prompts, sampling_params):
+        del prompts
         self.calls += 1
+        self.sampling_params.append(dict(sampling_params))
         job = tuple(jobs)[0]
-        assert sampling_params["json_schema"]
+        text = self.text
+        if "json_schema" not in sampling_params and self.fast_text is not None:
+            text = self.fast_text
+        elif "json_schema" in sampling_params and self.fallback_text is not None:
+            text = self.fallback_text
         return (
             InternalJobResult(
                 job=job,
-                text=self.text,
+                text=text,
                 prompt_tokens=100,
                 completion_tokens=32,
                 finish_reason=self.finish_reason,
@@ -98,6 +114,30 @@ def test_valid_capsule_is_persisted_and_restored(tmp_path):
     restored = ExecutionCapsuleStore(path).get("trajectory-1")
     assert restored is not None
     assert restored.capsule == VALID_CAPSULE
+    assert runner.calls == 1
+    assert "json_schema" not in runner.sampling_params[0]
+    assert runner.sampling_params[0]["custom_params"] == {"qwen_exo_dflash": "eligible"}
+
+
+def test_invalid_fast_capsule_falls_back_to_strict_target_generation(tmp_path):
+    runner = FakeRunner(
+        fast_text='{"summary":"partial"}',
+        fallback_text=json.dumps(VALID_CAPSULE),
+    )
+    service = ExecutionCapsuleService(
+        runner, ExecutionCapsuleStore(tmp_path / "capsules.json"), FakeTokenizer()
+    )
+
+    result = asyncio.run(service.update_many([update()]))[0]
+
+    assert result.valid
+    assert runner.calls == 2
+    assert "json_schema" not in runner.sampling_params[0]
+    assert runner.sampling_params[0]["custom_params"]["qwen_exo_dflash"] == ("eligible")
+    assert runner.sampling_params[1]["json_schema"]
+    assert runner.sampling_params[1]["custom_params"]["qwen_exo_dflash"] == (
+        "target_only"
+    )
 
 
 def test_invalid_capsule_does_not_overwrite_previous_state(tmp_path):

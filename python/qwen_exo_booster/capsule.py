@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -405,7 +405,6 @@ class ExecutionCapsuleService:
             )
 
         deadline = time.monotonic() + self.timeout_seconds
-        shared_prefix_key = "qwen-exo:v1:capsule:" + stable_digest(_CAPSULE_SYSTEM)[:24]
         job = InternalJob(
             parent_request_id=update.parent_request_id,
             turn_id=update.turn_id,
@@ -418,7 +417,9 @@ class ExecutionCapsuleService:
             )[:32],
             job_type=InternalJobType.CAPSULE_UPDATE,
             priority=-20,
-            shared_prefix_key=shared_prefix_key,
+            shared_prefix_key=(
+                "qwen-exo:v1:capsule:" + stable_digest(_CAPSULE_SYSTEM)[:24]
+            ),
             token_budget=self.token_budget,
             state_budget_bytes=0,
             deadline_monotonic=deadline,
@@ -429,49 +430,75 @@ class ExecutionCapsuleService:
             max_fanout=self.runner.max_fanout,
         )
         prompt = self._render_prompt(update)
+        fast_job = replace(
+            job,
+            job_id=job.job_id + ":dflash",
+            cancellation_token=CancellationToken("cancel-" + job.job_id + ":dflash"),
+        )
+        fast_sampling = {
+            "temperature": 0,
+            "top_p": 1,
+            "top_k": 1,
+            "skip_special_tokens": True,
+            "custom_params": {"qwen_exo_dflash": "eligible"},
+        }
         try:
             result = (
-                await self.runner.run_batch(
-                    [job],
-                    [prompt],
-                    {
-                        "temperature": 0,
-                        "top_p": 1,
-                        "top_k": 1,
-                        "json_schema": _CAPSULE_SCHEMA,
-                        "skip_special_tokens": True,
-                    },
-                )
+                await self.runner.run_batch((fast_job,), (prompt,), fast_sampling)
             )[0]
+            capsule = self._accepted_capsule(result)
         except asyncio.CancelledError:
             raise
         except Exception:
-            return CapsuleUpdateResult(
-                update=update,
-                record=current,
-                valid=False,
-                deduplicated=False,
-                tokens=0,
-                latency_seconds=0.0,
-            )
+            result = None
+            capsule = None
 
-        finish_reason = result.finish_reason or {}
-        finish_type = (
-            finish_reason.get("type")
-            if isinstance(finish_reason, dict)
-            else str(finish_reason)
-        )
-        if finish_type != "stop":
-            return CapsuleUpdateResult(
-                update=update,
-                record=current,
-                valid=False,
-                deduplicated=False,
-                tokens=result.completion_tokens,
-                latency_seconds=result.latency_seconds,
+        if capsule is None:
+            target_job = replace(
+                job,
+                job_id=job.job_id + ":target",
+                cancellation_token=CancellationToken(
+                    "cancel-" + job.job_id + ":target"
+                ),
             )
-        capsule = parse_execution_capsule(result.text)
-        record = self.store.commit(update, capsule) if capsule is not None else None
+            try:
+                result = (
+                    await self.runner.run_batch(
+                        (target_job,),
+                        (prompt,),
+                        {
+                            "temperature": 0,
+                            "top_p": 1,
+                            "top_k": 1,
+                            "json_schema": _CAPSULE_SCHEMA,
+                            "skip_special_tokens": True,
+                            "custom_params": {"qwen_exo_dflash": "target_only"},
+                        },
+                    )
+                )[0]
+                capsule = self._accepted_capsule(result)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return CapsuleUpdateResult(
+                    update=update,
+                    record=current,
+                    valid=False,
+                    deduplicated=False,
+                    tokens=0,
+                    latency_seconds=0.0,
+                )
+            if capsule is None:
+                return CapsuleUpdateResult(
+                    update=update,
+                    record=current,
+                    valid=False,
+                    deduplicated=False,
+                    tokens=result.completion_tokens,
+                    latency_seconds=result.latency_seconds,
+                )
+
+        record = self.store.commit(update, capsule)
         return CapsuleUpdateResult(
             update=update,
             record=record if record is not None else current,
@@ -480,6 +507,18 @@ class ExecutionCapsuleService:
             tokens=result.completion_tokens,
             latency_seconds=result.latency_seconds,
         )
+
+    @staticmethod
+    def _accepted_capsule(result):
+        finish_reason = result.finish_reason or {}
+        finish_type = (
+            finish_reason.get("type")
+            if isinstance(finish_reason, dict)
+            else str(finish_reason)
+        )
+        if finish_type != "stop":
+            return None
+        return parse_execution_capsule(result.text)
 
     def _render_prompt(self, update: CapsuleUpdateInput) -> str:
         source = {

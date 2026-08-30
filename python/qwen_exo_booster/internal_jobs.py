@@ -34,9 +34,10 @@ def _internal_custom_params(
         "qwen_exo_parent_request_id": job.parent_request_id,
         "qwen_exo_state_budget_bytes": job.state_budget_bytes,
     }
+    requested = custom.get("qwen_exo_dflash") == "eligible"
     eligible = (
         allow_dflash
-        and job.job_type in _DFLASH_ELIGIBLE_JOB_TYPES
+        and (job.job_type in _DFLASH_ELIGIBLE_JOB_TYPES or requested)
         and job.token_budget >= 32
         and not any(
             sampling_params.get(key) is not None for key in _DFLASH_STRUCTURED_KEYS
