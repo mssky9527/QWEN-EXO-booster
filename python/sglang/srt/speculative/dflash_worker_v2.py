@@ -41,6 +41,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    dflash_request_needs_target_logprobs,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
@@ -2032,10 +2033,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         needs_target_logprobs = bool(
             batch.return_logprob
-            or (
-                self.server_args.enable_qwen_exo
-                and self.server_args.qwen_exo_observer_mode != "off"
-            )
+            or any(dflash_request_needs_target_logprobs(req) for req in batch.reqs)
         )
         if needs_target_logprobs and not batch.forward_mode.is_idle():
             # DFlash is a linear target-verify chain: verify rows are already

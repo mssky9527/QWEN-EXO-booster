@@ -464,11 +464,11 @@ class AttentionSignalTracker:
         q_drifts = torch.where(active & previous_valid, q_drifts, nan_rows)
         memory_energies = torch.where(active & memory_valid, memory_energies, nan_rows)
 
-        q_sketches = self._compress_rows(current)
+        compressed = self._compress_rows(current)
         q_sketches = torch.where(
             active.unsqueeze(-1),
-            q_sketches,
-            torch.full_like(q_sketches, float("nan")),
+            compressed,
+            torch.full_like(compressed, float("nan")),
         )
         k_sketches = torch.full_like(q_sketches, float("nan"))
 

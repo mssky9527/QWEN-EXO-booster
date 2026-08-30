@@ -51,12 +51,15 @@ class TestDecisionMethodsHaveNoHiddenBatchChannel(unittest.TestCase):
 
 class TestDFlashActiveBatchIsolation(unittest.TestCase):
     @staticmethod
-    def _request(kind):
+    def _request(kind, dflash_mode=None):
+        custom_params = {"qwen_exo_kind": kind}
+        if dflash_mode is not None:
+            custom_params["qwen_exo_dflash"] = dflash_mode
         return SimpleNamespace(
             finished=lambda: False,
             return_hidden_states=False,
             sampling_params=SimpleNamespace(
-                custom_params={"qwen_exo_kind": kind},
+                custom_params=custom_params,
                 json_schema=None,
                 regex=None,
                 ebnf=None,
@@ -70,6 +73,16 @@ class TestDFlashActiveBatchIsolation(unittest.TestCase):
 
         self.assertEqual(
             Scheduler._dflash_active_request_flags(running_batch, last_batch),
+            (False, True),
+        )
+
+    def test_plain_internal_eligible_request_stays_in_speculative_lane(self):
+        batch = SimpleNamespace(
+            reqs=[self._request("internal", dflash_mode="eligible")]
+        )
+
+        self.assertEqual(
+            Scheduler._dflash_active_request_flags(batch),
             (False, True),
         )
 

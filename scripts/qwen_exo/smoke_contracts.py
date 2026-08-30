@@ -291,7 +291,8 @@ def main() -> int:
             memory_status == 200
             and memory_text == marker
             and telemetry_status == 200
-            and memory_payload.get("knowledge_admission_mode") == "semantic_eligibility"
+            and memory_payload.get("knowledge_admission_mode")
+            in {"semantic_eligibility", "comparative_semantic_selection"}
             and memory_native_restore.get("active") is True
             and memory_native_restore.get("lane") == "knowledge"
             and memory_native_restore.get("tokens", 0) > 0

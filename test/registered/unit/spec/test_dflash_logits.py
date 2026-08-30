@@ -115,6 +115,62 @@ def test_dflash_unsupported_features_use_target_only_fallback():
     assert validate_dflash_request(req, enable_overlap=True) is None
 
 
+def test_plain_internal_generation_can_use_dflash_but_grammar_stays_target_only():
+    from sglang.srt.speculative.dflash_utils import (
+        is_dflash_target_only_request,
+        validate_dflash_request,
+    )
+
+    req = SimpleNamespace(
+        return_logprob=False,
+        return_hidden_states=False,
+        sampling_params=SimpleNamespace(
+            json_schema=None,
+            regex=None,
+            ebnf=None,
+            structural_tag=None,
+            custom_params={
+                "qwen_exo_kind": "internal",
+                "qwen_exo_dflash": "eligible",
+            },
+        ),
+    )
+    assert not is_dflash_target_only_request(req)
+    assert validate_dflash_request(req, enable_overlap=True) is None
+
+    req.sampling_params.json_schema = {"type": "object"}
+    assert is_dflash_target_only_request(req)
+    assert validate_dflash_request(req, enable_overlap=True) is None
+
+
+def test_dflash_target_logprob_need_is_request_scoped():
+    from sglang.srt.speculative.dflash_utils import (
+        dflash_request_needs_target_logprobs,
+    )
+
+    def request(*, kind, job_type=None, return_logprob=False):
+        return SimpleNamespace(
+            return_logprob=return_logprob,
+            sampling_params=SimpleNamespace(
+                custom_params={
+                    "qwen_exo_kind": kind,
+                    **({"qwen_exo_job_type": job_type} if job_type else {}),
+                }
+            ),
+        )
+
+    assert dflash_request_needs_target_logprobs(request(kind="user"))
+    assert dflash_request_needs_target_logprobs(
+        request(kind="internal", job_type="query_probe")
+    )
+    assert dflash_request_needs_target_logprobs(
+        request(kind="internal", return_logprob=True)
+    )
+    assert not dflash_request_needs_target_logprobs(
+        request(kind="internal", job_type="response_compaction")
+    )
+
+
 def test_grouped_conv_supports_runtime_block_sizes():
     """The conv indexes a position inside the block, so it must follow whatever
     block size the worker resolved -- including one that is not a power of two."""

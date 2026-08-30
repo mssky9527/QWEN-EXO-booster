@@ -8,6 +8,46 @@ from typing import Any, Callable, Iterable
 
 from qwen_exo_booster.contracts import ContractViolation, InternalJob, InternalJobType
 
+_DFLASH_ELIGIBLE_JOB_TYPES = frozenset(
+    {
+        InternalJobType.RESPONSE_COMPACTION,
+        InternalJobType.SELF_ANSWER,
+        InternalJobType.REFLECTION_MEMORY,
+    }
+)
+_DFLASH_STRUCTURED_KEYS = ("json_schema", "regex", "ebnf", "structural_tag")
+
+
+def _internal_custom_params(
+    job: InternalJob,
+    base_custom: dict[str, Any],
+    override: dict[str, Any],
+    sampling_params: dict[str, Any],
+    *,
+    allow_dflash: bool,
+) -> dict[str, Any]:
+    custom = {
+        **base_custom,
+        **override,
+        "qwen_exo_kind": "internal",
+        "qwen_exo_job_type": job.job_type.value,
+        "qwen_exo_parent_request_id": job.parent_request_id,
+        "qwen_exo_state_budget_bytes": job.state_budget_bytes,
+    }
+    eligible = (
+        allow_dflash
+        and job.job_type in _DFLASH_ELIGIBLE_JOB_TYPES
+        and job.token_budget >= 32
+        and not any(
+            sampling_params.get(key) is not None for key in _DFLASH_STRUCTURED_KEYS
+        )
+    )
+    if eligible:
+        custom["qwen_exo_dflash"] = "eligible"
+    elif custom.get("qwen_exo_dflash") != "target_only":
+        custom.pop("qwen_exo_dflash", None)
+    return custom
+
 
 @dataclass(frozen=True, slots=True)
 class InternalJobResult:
@@ -135,14 +175,13 @@ class InternalJobRunner:
                     {
                         **sampling_params,
                         "max_new_tokens": job.token_budget,
-                        "custom_params": {
-                            **(sampling_params.get("custom_params") or {}),
-                            **per_job_custom[index],
-                            "qwen_exo_kind": "internal",
-                            "qwen_exo_job_type": job.job_type.value,
-                            "qwen_exo_parent_request_id": job.parent_request_id,
-                            "qwen_exo_state_budget_bytes": job.state_budget_bytes,
-                        },
+                        "custom_params": _internal_custom_params(
+                            job,
+                            sampling_params.get("custom_params") or {},
+                            per_job_custom[index],
+                            sampling_params,
+                            allow_dflash=True,
+                        ),
                     }
                     for index, job in enumerate(job_list)
                 ],
@@ -256,14 +295,13 @@ class InternalJobRunner:
                         "max_new_tokens": (
                             0 if job.job_type is InternalJobType.BANK_INDEX else 1
                         ),
-                        "custom_params": {
-                            **(base_sampling.get("custom_params") or {}),
-                            **per_job_custom[index],
-                            "qwen_exo_kind": "internal",
-                            "qwen_exo_job_type": job.job_type.value,
-                            "qwen_exo_parent_request_id": job.parent_request_id,
-                            "qwen_exo_state_budget_bytes": job.state_budget_bytes,
-                        },
+                        "custom_params": _internal_custom_params(
+                            job,
+                            base_sampling.get("custom_params") or {},
+                            per_job_custom[index],
+                            base_sampling,
+                            allow_dflash=False,
+                        ),
                     }
                     for index, job in enumerate(job_list)
                 ],

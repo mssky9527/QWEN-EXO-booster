@@ -1337,6 +1337,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             return
 
         observe_mask = tuple(forward_batch.qwen_exo_observe or ())
+        # Real eager batches expose the host-side mask. Skip inverse-RoPE and
+        # signal work when every row is disabled; capture/replay batches carry
+        # only the graph slot and must retain the graph path.
+        if observe_mask and not any(observe_mask) and not get_is_capture_mode():
+            return
         if forward_batch.forward_mode.is_target_verify():
             request_slots = forward_batch.req_pool_indices
             batch_size = int(request_slots.shape[0])

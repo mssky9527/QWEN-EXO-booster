@@ -15,6 +15,9 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+QWEN_EXO_DFLASH_MODE_KEY = "qwen_exo_dflash"
+QWEN_EXO_DFLASH_ELIGIBLE = "eligible"
+
 
 logger = logging.getLogger(__name__)
 
@@ -868,11 +871,21 @@ def _dflash_grammar_requested(req: Req) -> bool:
 
 def is_dflash_target_only_request(req: Req) -> bool:
     """Return whether DFLASH must route this request through the target only."""
-    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    custom_params = req.sampling_params.custom_params or {}
+    if _dflash_grammar_requested(req) or bool(req.return_hidden_states):
+        return True
+    if custom_params.get("qwen_exo_kind") == "internal":
+        return custom_params.get(QWEN_EXO_DFLASH_MODE_KEY) != QWEN_EXO_DFLASH_ELIGIBLE
+    return False
+
+
+def dflash_request_needs_target_logprobs(req: Req) -> bool:
+    """Return whether this request has a consumer for target token logprobs."""
+    custom_params = req.sampling_params.custom_params or {}
     return (
-        custom_params.get("qwen_exo_kind") == "internal"
-        or _dflash_grammar_requested(req)
-        or bool(req.return_hidden_states)
+        bool(req.return_logprob)
+        or custom_params.get("qwen_exo_kind") == "user"
+        or (custom_params.get("qwen_exo_job_type") == "query_probe")
     )
 
 
