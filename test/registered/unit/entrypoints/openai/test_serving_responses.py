@@ -1046,6 +1046,77 @@ class ResponsesThinkingDefaultTestCase(unittest.TestCase):
             )
         )
 
+    def test_explicit_none_disables_reasoning_boundary_and_observer_mode(self):
+        class FakeRuntime:
+            reasoning_end_token_id = 99
+            think_context_enabled = True
+
+            def __init__(self):
+                self.observed = []
+
+            def register_generation_prompt(self, *_args, **_kwargs):
+                pass
+
+            def observe_generation_result(self, _request_id, _result, **kwargs):
+                self.observed.append(kwargs)
+
+        async def generate(_request, _raw_request):
+            yield {
+                "text": "answer",
+                "output_ids": [1],
+                "meta_info": {
+                    "prompt_tokens": 2,
+                    "finish_reason": {"type": "stop"},
+                },
+            }
+
+        serving = make_serving()
+        serving.reasoning_parser = "qwen3"
+        serving.default_chat_template_kwargs = {"enable_thinking": True}
+        serving.template_manager.reasoning_config = SimpleNamespace(
+            toggle_param="enable_thinking",
+            default_enabled=True,
+            special_case=None,
+        )
+        serving.tokenizer_manager.generate_request.side_effect = generate
+        runtime = FakeRuntime()
+        raw_request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(qwen_exo_runtime=runtime))
+        )
+        adapted_request = GenerateReqInput(
+            input_ids=[1, 2],
+            sampling_params={"max_new_tokens": 8},
+            stream=False,
+            rid="resp-explicit-none",
+        )
+        request = ResponsesRequest(
+            model="x",
+            input="inspect",
+            reasoning={"effort": "none"},
+            store=False,
+        )
+
+        async def collect():
+            snapshots = []
+            async for current in serving._generate_with_builtin_tools(
+                "resp-explicit-none",
+                [1, 2],
+                adapted_request,
+                {"max_new_tokens": 8},
+                SimpleContext(),
+                raw_request=raw_request,
+                response_request=request,
+            ):
+                snapshots.append(current)
+            return snapshots
+
+        snapshots = asyncio.run(collect())
+        generated_request = serving.tokenizer_manager.generate_request.call_args.args[0]
+
+        self.assertNotIn("stop_token_ids", generated_request.sampling_params)
+        self.assertEqual(runtime.observed[0]["thinking_enabled"], False)
+        self.assertEqual(snapshots[-1].last_output["text"], "answer")
+
 
 class NativeThinkContinuationTestCase(unittest.TestCase):
     def test_phase_two_self_ask_spill_is_partitioned_from_final_text(self):
