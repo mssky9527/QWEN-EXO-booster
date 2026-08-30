@@ -854,17 +854,8 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def is_dflash_target_only_request(req: Req) -> bool:
-    """Keep every QWEN-EXO internal job on the target-only scheduler path."""
-    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
-    return custom_params.get("qwen_exo_kind") == "internal"
-
-
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
-    if enable_overlap and req.return_hidden_states:
-        return "DFLASH speculative decoding does not support return_hidden_states yet."
-
-    grammar_requested = any(
+def _dflash_grammar_requested(req: Req) -> bool:
+    return any(
         value is not None
         for value in (
             req.sampling_params.json_schema,
@@ -873,7 +864,24 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
             req.sampling_params.structural_tag,
         )
     )
-    if grammar_requested and not is_dflash_target_only_request(req):
+
+
+def is_dflash_target_only_request(req: Req) -> bool:
+    """Return whether DFLASH must route this request through the target only."""
+    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    return (
+        custom_params.get("qwen_exo_kind") == "internal"
+        or _dflash_grammar_requested(req)
+        or bool(req.return_hidden_states)
+    )
+
+
+def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+    if is_dflash_target_only_request(req):
+        return None
+    if enable_overlap and req.return_hidden_states:
+        return "DFLASH speculative decoding does not support return_hidden_states yet."
+    if _dflash_grammar_requested(req):
         return (
             "DFLASH speculative decoding does not support "
             "grammar-constrained decoding yet."

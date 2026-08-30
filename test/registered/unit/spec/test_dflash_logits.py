@@ -83,7 +83,7 @@ def test_selector_rejects_a_quantized_target_lm_head():
         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
 
 
-def test_dflash_internal_requests_use_target_only_fallback():
+def test_dflash_unsupported_features_use_target_only_fallback():
     from sglang.srt.speculative.dflash_utils import (
         is_dflash_target_only_request,
         validate_dflash_request,
@@ -104,14 +104,15 @@ def test_dflash_internal_requests_use_target_only_fallback():
     assert validate_dflash_request(req, enable_overlap=True) is None
 
     req.sampling_params.custom_params = {
-        "qwen_exo_kind": "internal",
-        "qwen_exo_job_type": "query_probe",
+        "qwen_exo_kind": "user",
     }
     assert is_dflash_target_only_request(req)
+    assert validate_dflash_request(req, enable_overlap=True) is None
 
-    req.sampling_params.custom_params = {"qwen_exo_kind": "user"}
-    assert not is_dflash_target_only_request(req)
-    assert "grammar-constrained" in validate_dflash_request(req, enable_overlap=True)
+    req.sampling_params.json_schema = None
+    req.return_hidden_states = True
+    assert is_dflash_target_only_request(req)
+    assert validate_dflash_request(req, enable_overlap=True) is None
 
 
 def test_grouped_conv_supports_runtime_block_sizes():
