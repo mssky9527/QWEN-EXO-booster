@@ -384,7 +384,9 @@ async def lifespan(fast_api_app: FastAPI):
         qwen_exo_runtime = QwenExoRuntime.from_server_args(
             server_args, _global_state.tokenizer_manager
         )
-        await qwen_exo_runtime.start()
+        await qwen_exo_runtime.start(
+            run_startup_warmup=not server_args.skip_server_warmup
+        )
         fast_api_app.state.qwen_exo_runtime = qwen_exo_runtime
 
     # Execute custom warmups

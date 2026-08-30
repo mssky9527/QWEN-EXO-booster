@@ -555,6 +555,37 @@ def test_runtime_creates_authoritative_directories(tmp_path, monkeypatch):
     assert runtime.state is QwenExoRuntimeState.STOPPED
 
 
+def test_runtime_startup_warmup_records_native_probe_result():
+    calls = []
+    events = []
+
+    class Probe:
+        async def warmup(self):
+            calls.append("warmup")
+            return SimpleNamespace(
+                status="ready",
+                prompt_tokens=264,
+                latency_seconds=0.25,
+                cache_hit=False,
+            )
+
+    runtime = object.__new__(QwenExoRuntime)
+    runtime.query_probe = Probe()
+    runtime.telemetry = SimpleNamespace(
+        emit=lambda request_id, event_type, payload: events.append(
+            (request_id, event_type, payload)
+        )
+    )
+
+    asyncio.run(runtime._run_startup_warmup())
+
+    assert calls == ["warmup"]
+    assert events[0][0:2] == ("runtime", "runtime.startup_warmup")
+    assert events[0][2]["query_probe_status"] == "ready"
+    assert events[0][2]["query_probe_prompt_tokens"] == 264
+    assert events[0][2]["cache_hit"] is False
+
+
 def test_runtime_builds_think_context_from_real_refresh_record():
     record = RefreshRecord(
         parent_request_id="request-real",

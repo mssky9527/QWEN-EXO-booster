@@ -615,7 +615,38 @@ class QwenExoRuntime:
         self.telemetry.emit("runtime", "knowledge.pre_complete_consumed", payload)
         return payload
 
-    async def start(self) -> None:
+    async def _run_startup_warmup(self) -> None:
+        if self.query_probe is None:
+            return
+        started = time.perf_counter()
+        result = await self.query_probe.warmup()
+        elapsed = time.perf_counter() - started
+        self.telemetry.emit(
+            "runtime",
+            "runtime.startup_warmup",
+            {
+                "query_probe_status": result.status,
+                "query_probe_prompt_tokens": result.prompt_tokens,
+                "query_probe_latency_seconds": result.latency_seconds,
+                "elapsed_seconds": elapsed,
+                "cache_hit": result.cache_hit,
+            },
+        )
+        if result.status == "failed_closed":
+            logger.warning(
+                "QWEN_EXO_STARTUP_WARMUP failed closed status=%s elapsed=%.3fs",
+                result.status,
+                elapsed,
+            )
+        else:
+            logger.info(
+                "QWEN_EXO_STARTUP_WARMUP status=%s prompt_tokens=%d elapsed=%.3fs",
+                result.status,
+                result.prompt_tokens,
+                elapsed,
+            )
+
+    async def start(self, *, run_startup_warmup: bool = True) -> None:
         async with self._lifecycle_lock:
             if self.state is QwenExoRuntimeState.READY:
                 return
@@ -851,6 +882,8 @@ class QwenExoRuntime:
                             self.config.response_compaction_max_output_tokens
                         ),
                     )
+                if run_startup_warmup:
+                    await self._run_startup_warmup()
                 self.state = QwenExoRuntimeState.READY
                 self.telemetry.emit(
                     "runtime",

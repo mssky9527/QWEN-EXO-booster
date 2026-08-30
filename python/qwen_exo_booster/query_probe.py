@@ -19,6 +19,10 @@ from qwen_exo_booster.internal_jobs import InternalJobRunner
 _MAX_QUERY_STATES = 8
 _QUERY_ROLES = frozenset({"original_task", "current_user", "trajectory_compaction"})
 _ANCHOR_QUERY_ROLES = frozenset({"original_task", "current_user"})
+_STARTUP_WARMUP_PARENT_ID = "runtime"
+_STARTUP_WARMUP_QUERY = (
+    "Inspect the current execution context and identify the relevant evidence."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +155,18 @@ class QueryProbeService:
             OrderedDict()
         )
         self._cache_lock = asyncio.Lock()
+
+    async def warmup(self) -> QueryProbeResult:
+        """Prime the scheduler-native query-probe forward during startup.
+
+        The result is not associated with a user request. The reserved runtime
+        telemetry identity keeps this internal probe out of request traces while
+        the normal ``InternalJobRunner`` path warms the model and kernel caches.
+        """
+        return await self.probe(
+            _STARTUP_WARMUP_PARENT_ID,
+            QueryProbePlan.current_user(_STARTUP_WARMUP_QUERY),
+        )
 
     async def probe(
         self, parent_request_id: str, plan: QueryProbePlan

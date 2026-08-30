@@ -224,6 +224,26 @@ def test_query_probe_returns_finite_raw_q_heads_from_hidden_job():
     ]
 
 
+def test_query_probe_startup_warmup_uses_reserved_runtime_job_identity():
+    runner = FakeProbeRunner()
+    probe = QueryProbeService(
+        runner,
+        FakeTokenizer(),
+        FakeTelemetry(),
+        max_prompt_tokens=16,
+        query_head_count=2,
+        head_dim=2,
+    )
+
+    result = asyncio.run(probe.warmup())
+
+    assert result.status == "ready"
+    jobs, _prompts, _sampling, _custom = runner.calls[0]
+    assert jobs[0].parent_request_id == "runtime"
+    assert jobs[0].job_type is InternalJobType.QUERY_PROBE
+    assert jobs[0].job_id.startswith("qwen-exo-query-probe-")
+
+
 def test_query_probe_reuses_exact_raw_q_heads_without_disabling_probe():
     runner = FakeProbeRunner()
     telemetry = FakeTelemetry()
