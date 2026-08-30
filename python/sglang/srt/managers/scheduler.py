@@ -3582,7 +3582,9 @@ class Scheduler(
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         else:
-            prefill_plan = self.get_new_batch_prefill(running_batch)
+            prefill_plan = self.get_new_batch_prefill(
+                running_batch, last_batch=last_batch
+            )
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
 
@@ -3632,7 +3634,27 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+    @staticmethod
+    def _dflash_active_request_flags(
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch] = None,
+    ) -> Tuple[bool, bool]:
+        """Return target-only and non-target request presence across in-flight batches."""
+        active_requests = [req for req in running_batch.reqs if not req.finished()]
+        if last_batch is not None and last_batch is not running_batch:
+            active_requests.extend(req for req in last_batch.reqs if not req.finished())
+        return (
+            bool(active_requests)
+            and all(is_dflash_target_only_request(req) for req in active_requests),
+            any(not is_dflash_target_only_request(req) for req in active_requests),
+        )
+
+    def get_new_batch_prefill(
+        self,
+        running_batch: ScheduleBatch,
+        *,
+        last_batch: Optional[ScheduleBatch] = None,
+    ) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -3646,6 +3668,7 @@ class Scheduler(
         ret, running_batch = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             running_batch=running_batch,
+            last_batch=last_batch,
         )
 
         if self.prefill_delayer:
@@ -3657,6 +3680,7 @@ class Scheduler(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch] = None,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -3768,15 +3792,10 @@ class Scheduler(
                 )
 
         rejected_qwen_reqs: List[Req] = []
-        active_running_reqs = tuple(
-            req for req in running_batch.reqs if not req.finished()
-        )
-        active_running_has_target_only = bool(active_running_reqs) and all(
-            is_dflash_target_only_request(req) for req in active_running_reqs
-        )
-        active_running_has_non_target_only = any(
-            not is_dflash_target_only_request(req) for req in active_running_reqs
-        )
+        (
+            active_running_has_target_only,
+            active_running_has_non_target_only,
+        ) = self._dflash_active_request_flags(running_batch, last_batch)
         target_only_waiting = (
             self.spec_algorithm.is_dflash()
             and not active_running_has_target_only

@@ -1,6 +1,7 @@
 import inspect
 import unittest
 
+from types import SimpleNamespace
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -46,6 +47,31 @@ class TestDecisionMethodsHaveNoHiddenBatchChannel(unittest.TestCase):
                         "explicitly and return it via NextBatchPlan instead."
                     ),
                 )
+
+
+class TestDFlashActiveBatchIsolation(unittest.TestCase):
+    @staticmethod
+    def _request(kind):
+        return SimpleNamespace(
+            finished=lambda: False,
+            return_hidden_states=False,
+            sampling_params=SimpleNamespace(
+                custom_params={"qwen_exo_kind": kind},
+                json_schema=None,
+                regex=None,
+                ebnf=None,
+                structural_tag=None,
+            ),
+        )
+
+    def test_inflight_last_batch_blocks_opposite_target_only_prefill(self):
+        running_batch = SimpleNamespace(reqs=[self._request("user")])
+        last_batch = SimpleNamespace(reqs=[self._request("internal")])
+
+        self.assertEqual(
+            Scheduler._dflash_active_request_flags(running_batch, last_batch),
+            (False, True),
+        )
 
 
 if __name__ == "__main__":
