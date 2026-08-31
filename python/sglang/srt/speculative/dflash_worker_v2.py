@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
@@ -495,6 +496,85 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
+        self._warmup_think_acceptance_kernel()
+
+    def _warmup_think_acceptance_kernel(self) -> None:
+        """Compile the optional active Think rejection kernel before readiness."""
+        if self.think_accept_mode != "active" or not is_cuda() or self.block_size <= 1:
+            return
+        started = time.perf_counter()
+        try:
+            from sglang.kernels.ops.speculative.reject_sampling import (
+                chain_speculative_sampling_triton,
+            )
+            from sglang.srt.speculative.dflash_utils import (
+                _get_or_create_chain_verify_buffers,
+            )
+
+            block_size = int(self.block_size)
+            vocab_size = int(self.model_runner.model_config.vocab_size)
+            device = self.device
+            candidates = torch.zeros(
+                (1, block_size), dtype=torch.int64, device=device
+            )
+            target_probs = torch.full(
+                (1, block_size, vocab_size),
+                1.0 / vocab_size,
+                dtype=torch.float32,
+                device=device,
+            )
+            draft_probs = torch.zeros_like(target_probs)
+            uniform_samples = torch.full(
+                (1, block_size), 0.5, dtype=torch.float32, device=device
+            )
+            uniform_samples_final = torch.full(
+                (1,), 0.5, dtype=torch.float32, device=device
+            )
+            force_accept_mask = torch.zeros(
+                (1, block_size - 1), dtype=torch.bool, device=device
+            )
+            (
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                predicts,
+                accept_index,
+                accept_token_num,
+            ) = _get_or_create_chain_verify_buffers(
+                bs=1, draft_token_num=block_size, device=device
+            )
+            chain_speculative_sampling_triton(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrive_index=retrieve_index,
+                retrive_next_token=retrieve_next_token,
+                retrive_next_sibling=retrieve_next_sibling,
+                uniform_samples=uniform_samples,
+                uniform_samples_for_final_sampling=uniform_samples_final,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=1.0,
+                threshold_acc=1.0,
+                deterministic=True,
+                force_accept_mask=force_accept_mask,
+            )
+            torch.cuda.synchronize(device)
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH Think active rejection kernel warmup complete. elapsed=%.2fs",
+                    time.perf_counter() - started,
+                )
+        except Exception as exc:
+            # A failed optional experiment must not take down an otherwise valid
+            # DFLASH server; shadow mode preserves measurement without mutation.
+            self.think_accept_mode = "shadow"
+            logger.warning(
+                "DFLASH Think active rejection kernel warmup failed; disabling "
+                "relaxed acceptance: %s",
+                exc,
+            )
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
