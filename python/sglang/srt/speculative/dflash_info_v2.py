@@ -237,7 +237,12 @@ class DFlashDraftInputV2(SpecInput):
         self.new_seq_lens = self.new_seq_lens[new_indices]
         self.hidden_states = self.hidden_states[new_indices]
 
-    def merge_batch(self, spec_info: "DFlashDraftInputV2"):
+    def merge_batch(self, spec_info: Optional["DFlashDraftInputV2"]):
+        if spec_info is None:
+            raise RuntimeError(
+                "DFLASH cannot merge a target-only batch into a speculative batch. "
+                "The scheduler must keep target-only and DFLASH batches isolated."
+            )
         if self.reserved_seq_lens_cpu is not None:
             assert spec_info.reserved_seq_lens_cpu is not None
             self.reserved_seq_lens_cpu = torch.cat(

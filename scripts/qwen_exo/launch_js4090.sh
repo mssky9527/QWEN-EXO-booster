@@ -11,7 +11,7 @@ set -euo pipefail
 : "${QWEN_EXO_DTYPE:=bfloat16}"
 : "${QWEN_EXO_QUANTIZATION:=}"
 : "${QWEN_EXO_KV_CACHE_DTYPE:=fp8_e4m3}"
-: "${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING:-0}"
+: "${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING:=0}"
 : "${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY:=0}"
 : "${QWEN_EXO_SPECULATIVE_ALGORITHM:=}"
 : "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_PATH:=}"
@@ -19,6 +19,9 @@ set -euo pipefail
 : "${QWEN_EXO_SPECULATIVE_NUM_STEPS:=}"
 : "${QWEN_EXO_SPECULATIVE_EAGLE_TOPK:=}"
 : "${QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS:=}"
+# Experimental only: keep relaxed acceptance disabled unless explicitly benchmarked.
+: "${QWEN_EXO_DFLASH_THINK_ACCEPT_MODE:=off}"
+: "${QWEN_EXO_DFLASH_THINK_ACCEPT_PROBABILITY:=0.60}"
 : "${QWEN_EXO_SERVICE_CONFIG_PATH:=/data/qwen-exo/service-config.json}"
 if [[ -n "${QWEN_EXO_QUANTIZATION}" ]]; then
   QWEN_EXO_QUANTIZATION_LABEL="${QWEN_EXO_QUANTIZATION}"
@@ -379,6 +382,8 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
     --qwen-exo-reflection-memory-max-output-tokens "${QWEN_EXO_REFLECTION_MEMORY_MAX_OUTPUT_TOKENS}"
     --qwen-exo-reflection-memory-max-history-tokens "${QWEN_EXO_REFLECTION_MEMORY_MAX_HISTORY_TOKENS}"
     --qwen-exo-response-compaction-mode "${QWEN_EXO_RESPONSE_COMPACTION_MODE}"
+    --qwen-exo-dflash-think-accept-mode "${QWEN_EXO_DFLASH_THINK_ACCEPT_MODE}"
+    --qwen-exo-dflash-think-accept-probability "${QWEN_EXO_DFLASH_THINK_ACCEPT_PROBABILITY}"
   )
   if [[ -n "${QWEN_EXO_MOE_TOP_K}" ]]; then
     server_args+=( --qwen-exo-moe-top-k "${QWEN_EXO_MOE_TOP_K}" )

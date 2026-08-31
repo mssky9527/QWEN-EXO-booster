@@ -87,6 +87,72 @@ class TestResolveGreedyMaskBatchShape(CustomTestCase):
         torch.testing.assert_close(sampler.temperatures, torch.tensor([1.0]))
 
 
+
+class TestDflashThinkAcceptanceTelemetry(CustomTestCase):
+    def test_phase_mask_stops_at_think_end_and_root_boundary(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(think_end_id=9)
+            )
+        )
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(
+                    sampling_params=SimpleNamespace(
+                        custom_params={"qwen_exo_dflash_think_phase": True}
+                    )
+                )
+            ]
+        )
+
+        before_end = DFlashWorkerV2._think_accept_phase_mask(
+            worker, batch, torch.tensor([[7, 9, 4, 5]])
+        )
+        at_root_end = DFlashWorkerV2._think_accept_phase_mask(
+            worker, batch, torch.tensor([[9, 2, 4, 5]])
+        )
+        torch.testing.assert_close(before_end, torch.tensor([[True, False, False]]))
+        torch.testing.assert_close(at_root_end, torch.tensor([[False, False, False]]))
+
+        worker.model_runner.model_config.think_end_id = None
+        without_boundary = DFlashWorkerV2._think_accept_phase_mask(
+            worker, batch, torch.tensor([[7, 2, 4, 5]])
+        )
+        torch.testing.assert_close(
+            without_boundary, torch.tensor([[False, False, False]])
+        )
+
+    def test_dump_reports_rates_and_draft_token_gain(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        worker = SimpleNamespace(
+            _think_accept_stats={
+                "verify_ct": 2,
+                "think_request_ct": 2,
+                "candidate_ct": 10,
+                "force_accept_ct": 4,
+                "force_nonexact_ct": 3,
+                "strict_draft_tokens": 5,
+                "relaxed_draft_tokens": 9,
+                "actual_draft_tokens": 8,
+            },
+            think_accept_mode="shadow",
+            think_accept_probability=0.6,
+        )
+
+        stats = DFlashWorkerV2.dump_think_accept_stats(worker)
+
+        self.assertEqual(stats["mode"], "shadow")
+        self.assertEqual(stats["verify_ct"], 2)
+        self.assertAlmostEqual(stats["force_accept_rate"], 0.4)
+        self.assertAlmostEqual(stats["force_nonexact_rate"], 0.3)
+        self.assertEqual(stats["relaxed_gain_draft_tokens"], 4)
+        self.assertEqual(stats["actual_gain_draft_tokens"], 3)
+        self.assertAlmostEqual(stats["avg_actual_draft_tokens"], 4.0)
+
+
 class TestCompactSeqLensHostBound(CustomTestCase):
     def test_upper_bound_of_exact(self):
         g = torch.Generator().manual_seed(0)
@@ -317,6 +383,20 @@ class TestFilterBatchHostIndices(CustomTestCase):
         torch.testing.assert_close(a.reserved_seq_lens_cpu, b.reserved_seq_lens_cpu)
         self.assertEqual(a.reserved_seq_lens_sum, b.reserved_seq_lens_sum)
         torch.testing.assert_close(a.future_indices, b.future_indices)
+
+
+class TestMergeBatchGuard(CustomTestCase):
+    def test_target_only_spec_state_fails_closed(self):
+        """Regression: scheduler overlap can reach merge with target-only state.
+
+        The old code treated `spec_info=None` as another DFLASH draft input and
+        crashed on `reserved_seq_lens_cpu`. Keep this an explicit invariant instead.
+        """
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+        info = DFlashDraftInputV2.create_idle_input(device=torch.device("cpu"))
+        with self.assertRaisesRegex(RuntimeError, "target-only"):
+            info.merge_batch(None)
 
 
 if __name__ == "__main__":

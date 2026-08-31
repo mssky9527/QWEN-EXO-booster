@@ -3219,6 +3219,20 @@ class ServerArgs:
         int,
         "Maximum system-instruction and tool-schema anchor spans carried into decode attention.",
     ] = 2
+    qwen_exo_dflash_think_accept_mode: A[
+        str,
+        Arg(
+            help=(
+                "Experimental DFLASH Think-only relaxed acceptance: off, shadow "
+                "(measure only), or active (commit near-top draft tokens)."
+            ),
+            choices=["off", "shadow", "active"],
+        ),
+    ] = "off"
+    qwen_exo_dflash_think_accept_probability: A[
+        float,
+        "Experimental DFLASH Think-only relative probability threshold; 0.60 means candidate probability at least 60% of the row maximum.",
+    ] = 0.60
     qwen_exo_latent_transplant_enabled: A[
         bool,
         Arg(
@@ -3890,6 +3904,28 @@ class ServerArgs:
             raise ValueError("--qwen-exo-moe-extra-experts must be non-negative")
         if not self.enable_qwen_exo:
             return
+        if self.qwen_exo_dflash_think_accept_mode not in {
+            "off",
+            "shadow",
+            "active",
+        }:
+            raise ValueError(
+                "--qwen-exo-dflash-think-accept-mode must be off, shadow, or active"
+            )
+        if not math.isfinite(self.qwen_exo_dflash_think_accept_probability) or not (
+            0.0 < self.qwen_exo_dflash_think_accept_probability <= 1.0
+        ):
+            raise ValueError(
+                "--qwen-exo-dflash-think-accept-probability must be within (0, 1]"
+            )
+        if (
+            self.qwen_exo_dflash_think_accept_mode != "off"
+            and str(self.speculative_algorithm or "").upper() != "DFLASH"
+        ):
+            raise ValueError(
+                "DFLASH Think probability acceptance requires "
+                "--speculative-algorithm DFLASH"
+            )
         if envs.SGLANG_USE_MLX.get() and not use_mlx():
             raise ValueError(
                 "QWEN-EXO MLX was requested through SGLANG_USE_MLX=1, but "

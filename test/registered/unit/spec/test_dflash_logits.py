@@ -171,6 +171,64 @@ def test_dflash_target_logprob_need_is_request_scoped():
     )
 
 
+def test_dflash_think_acceptance_is_relative_and_phase_limited():
+    from sglang.srt.speculative.dflash_utils import dflash_think_acceptance_mask
+
+    # Candidate positions are candidates[:, 1:]. The first target row is a
+    # near-top candidate (exp(-0.5) ~= 0.607), while the second is below 0.60.
+    candidates = torch.tensor([[11, 2, 3]])
+    target_logits = torch.tensor(
+        [
+            [0.0, 0.0, -0.5, -4.0],
+            [0.0, 0.0, -4.0, -0.6],
+            [0.0, 0.0, -4.0, -0.6],
+        ]
+    )
+    think_mask = torch.tensor([[True, True]])
+
+    force_mask, relative_probability = dflash_think_acceptance_mask(
+        candidates=candidates,
+        target_logits=target_logits,
+        think_mask=think_mask,
+        probability_threshold=0.60,
+    )
+
+    assert force_mask.tolist() == [[True, False]]
+    assert relative_probability[0, 0].item() == pytest.approx(
+        torch.exp(torch.tensor(-0.5)).item(), rel=1e-5
+    )
+
+    answer_only_mask, _ = dflash_think_acceptance_mask(
+        candidates=candidates,
+        target_logits=target_logits,
+        think_mask=torch.zeros_like(think_mask),
+        probability_threshold=0.0,
+    )
+    assert not bool(answer_only_mask.any())
+
+
+def test_dflash_think_acceptance_rejects_invalid_shapes_and_thresholds():
+    from sglang.srt.speculative.dflash_utils import dflash_think_acceptance_mask
+
+    candidates = torch.tensor([[0, 1]])
+    logits = torch.zeros((2, 4))
+    phase = torch.ones((1, 1), dtype=torch.bool)
+    with pytest.raises(ValueError, match=r"within \[0, 1\]"):
+        dflash_think_acceptance_mask(
+            candidates=candidates,
+            target_logits=logits,
+            think_mask=phase,
+            probability_threshold=1.1,
+        )
+    with pytest.raises(ValueError, match="row count"):
+        dflash_think_acceptance_mask(
+            candidates=candidates,
+            target_logits=logits[:1],
+            think_mask=phase,
+            probability_threshold=0.6,
+        )
+
+
 def test_grouped_conv_supports_runtime_block_sizes():
     """The conv indexes a position inside the block, so it must follow whatever
     block size the worker resolved -- including one that is not a power of two."""

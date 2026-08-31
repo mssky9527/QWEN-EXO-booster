@@ -42,6 +42,11 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
     dflash_request_needs_target_logprobs,
+    dflash_think_acceptance_mask,
+    DFLASH_THINK_ACCEPT_MODES,
+    QWEN_EXO_DFLASH_THINK_ACCEPT_MODE_KEY,
+    QWEN_EXO_DFLASH_THINK_ACCEPT_PROBABILITY_KEY,
+    QWEN_EXO_DFLASH_THINK_PHASE_KEY,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
@@ -282,6 +287,39 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
         self._logged_first_verify = False
+        self.think_end_id: Optional[int] = None
+        self.think_accept_mode = str(
+            getattr(server_args, QWEN_EXO_DFLASH_THINK_ACCEPT_MODE_KEY, "off") or "off"
+        ).lower()
+        if self.think_accept_mode not in DFLASH_THINK_ACCEPT_MODES:
+            raise ValueError(
+                "Invalid QWEN-EXO DFLASH Think accept mode: "
+                f"{self.think_accept_mode!r}"
+            )
+        self.think_accept_probability = float(
+            getattr(
+                server_args,
+                QWEN_EXO_DFLASH_THINK_ACCEPT_PROBABILITY_KEY,
+                0.60,
+            )
+        )
+        if not math.isfinite(self.think_accept_probability) or not (
+            0.0 < self.think_accept_probability <= 1.0
+        ):
+            raise ValueError(
+                "QWEN-EXO DFLASH Think accept probability must be within (0, 1], "
+                f"got {self.think_accept_probability!r}"
+            )
+        self._think_accept_stats = {
+            "verify_ct": 0,
+            "think_request_ct": 0,
+            "candidate_ct": 0,
+            "force_accept_ct": 0,
+            "force_nonexact_ct": 0,
+            "strict_draft_tokens": 0,
+            "relaxed_draft_tokens": 0,
+            "actual_draft_tokens": 0,
+        }
 
         bundle = build_draft_tp_worker(
             server_args=server_args,
@@ -969,6 +1007,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         q_rows: torch.Tensor,
         sampling_info,
         draft_input,
+        force_accept_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Expand sparse selector probabilities for the generic sampling kernel."""
         bs, block = candidates.shape
@@ -993,6 +1032,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 gamma=gamma,
                 verify_num_draft_tokens=block,
                 cutoff_verify_lens=None,
+                force_accept_mask=force_accept_mask,
             )
         finally:
             draft_probs.scatter_(-1, candidate_ids, 0.0)
@@ -1536,6 +1576,170 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._new_seq_lens_bufs[slot][:bs],
         )
 
+    def set_think_end_id(self, think_end_id: Optional[int]) -> None:
+        self.think_end_id = None if think_end_id is None else int(think_end_id)
+
+    @staticmethod
+    def _request_is_think_accept_phase(req) -> bool:
+        custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+        return bool(custom_params.get(QWEN_EXO_DFLASH_THINK_PHASE_KEY, False))
+
+    def _think_accept_phase_mask(
+        self, batch: ScheduleBatch, candidates: torch.Tensor
+    ) -> torch.Tensor:
+        """Return per-draft-position masks for the current Think phase only."""
+        bs, block_size = candidates.shape
+        gamma = max(0, int(block_size) - 1)
+        request_mask = torch.tensor(
+            [self._request_is_think_accept_phase(req) for req in batch.reqs],
+            dtype=torch.bool,
+            device=candidates.device,
+        )
+        if gamma == 0:
+            return torch.empty((bs, 0), dtype=torch.bool, device=candidates.device)
+        phase_mask = request_mask[:, None].expand(bs, gamma)
+        think_end_id = getattr(self, "think_end_id", None)
+        if think_end_id is None:
+            think_end_id = getattr(self.model_runner.model_config, "think_end_id", None)
+        if think_end_id is None:
+            return torch.zeros_like(phase_mask)
+        if gamma <= 1:
+            return phase_mask
+        end_hits = candidates[:, 1:] == int(think_end_id)
+        seen_end_before = torch.zeros_like(end_hits)
+        seen_end_before[:, 0] = candidates[:, 0] == int(think_end_id)
+        if gamma > 1:
+            seen_end_before[:, 1:] = (
+                torch.cumsum(end_hits[:, :-1].to(torch.int32), dim=1) > 0
+            )
+        return phase_mask & ~seen_end_before
+
+    @staticmethod
+    def _prefix_accept_lengths(matches: torch.Tensor) -> torch.Tensor:
+        if matches.shape[-1] == 0:
+            return torch.zeros(
+                (matches.shape[0],), dtype=torch.int32, device=matches.device
+            )
+        return matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+
+    def _prepare_think_acceptance(
+        self,
+        batch: ScheduleBatch,
+        candidates: torch.Tensor,
+        target_logits: torch.Tensor,
+        sampling_info,
+    ) -> dict[str, torch.Tensor] | None:
+        if self.think_accept_mode == "off":
+            return None
+        if not any(
+            self._request_is_think_accept_phase(req) for req in batch.reqs
+        ):
+            return None
+        if candidates.shape[1] <= 1 or (
+            getattr(self, "think_end_id", None) is None
+            and getattr(self.model_runner.model_config, "think_end_id", None) is None
+        ):
+            return None
+        think_mask = self._think_accept_phase_mask(batch, candidates)
+        target_logits_3d = target_logits.reshape(
+            candidates.shape[0], candidates.shape[1], -1
+        )
+        target_max_logits, target_predict = target_logits_3d.max(dim=-1)
+        temperatures = (
+            getattr(sampling_info, "temperatures", None)
+            if sampling_info is not None
+            else None
+        )
+        force_mask, relative_probability = dflash_think_acceptance_mask(
+            candidates=candidates,
+            target_logits=target_logits,
+            think_mask=think_mask,
+            probability_threshold=self.think_accept_probability,
+            temperatures=temperatures,
+            target_max_logits=target_max_logits[:, :-1],
+        )
+        strict_matches = candidates[:, 1:] == target_predict[:, :-1]
+        relaxed_matches = strict_matches | force_mask
+        return {
+            "think_mask": think_mask,
+            "force_mask": force_mask,
+            "relative_probability": relative_probability,
+            "strict_len": self._prefix_accept_lengths(strict_matches),
+            "relaxed_len": self._prefix_accept_lengths(relaxed_matches),
+            "strict_matches": strict_matches,
+        }
+
+    def _record_think_acceptance(
+        self,
+        batch: ScheduleBatch,
+        experiment: dict[str, torch.Tensor] | None,
+        actual_draft_len: torch.Tensor,
+    ) -> None:
+        if experiment is None:
+            return
+        force_mask = experiment["force_mask"]
+        strict_matches = experiment["strict_matches"]
+        think_mask = experiment["think_mask"]
+        values = {
+            "verify_ct": 1,
+            "think_request_ct": int(think_mask.any(dim=1).sum().item()),
+            "candidate_ct": int(think_mask.sum().item()),
+            "force_accept_ct": int(force_mask.sum().item()),
+            "force_nonexact_ct": int((force_mask & ~strict_matches).sum().item()),
+            "strict_draft_tokens": int(experiment["strict_len"].sum().item()),
+            "relaxed_draft_tokens": int(experiment["relaxed_len"].sum().item()),
+            "actual_draft_tokens": int(actual_draft_len.sum().item()),
+        }
+        for key, value in values.items():
+            self._think_accept_stats[key] += value
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DFLASH Think probability acceptance: mode=%s threshold=%.3f "
+                "batch=%d candidates=%d force=%d force_nonexact=%d "
+                "strict_len=%d relaxed_len=%d actual_len=%d",
+                self.think_accept_mode,
+                self.think_accept_probability,
+                len(batch.reqs),
+                values["candidate_ct"],
+                values["force_accept_ct"],
+                values["force_nonexact_ct"],
+                values["strict_draft_tokens"],
+                values["relaxed_draft_tokens"],
+                values["actual_draft_tokens"],
+            )
+
+    def dump_think_accept_stats(self) -> dict[str, int | float | str]:
+        result = dict(self._think_accept_stats)
+        result["mode"] = self.think_accept_mode
+        result["probability_threshold"] = self.think_accept_probability
+        verify_ct = int(result["verify_ct"])
+        candidate_ct = int(result["candidate_ct"])
+        result["force_accept_rate"] = (
+            int(result["force_accept_ct"]) / candidate_ct if candidate_ct else 0.0
+        )
+        result["force_nonexact_rate"] = (
+            int(result["force_nonexact_ct"]) / candidate_ct
+            if candidate_ct
+            else 0.0
+        )
+        result["relaxed_gain_draft_tokens"] = int(
+            result["relaxed_draft_tokens"]
+        ) - int(result["strict_draft_tokens"])
+        result["actual_gain_draft_tokens"] = int(
+            result["actual_draft_tokens"]
+        ) - int(result["strict_draft_tokens"])
+        if verify_ct:
+            result["avg_strict_draft_tokens"] = (
+                int(result["strict_draft_tokens"]) / verify_ct
+            )
+            result["avg_relaxed_draft_tokens"] = (
+                int(result["relaxed_draft_tokens"]) / verify_ct
+            )
+            result["avg_actual_draft_tokens"] = (
+                int(result["actual_draft_tokens"]) / verify_ct
+            )
+        return result
+
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
         # A selector draft carries its own q and verifies through accept_sampling, so
@@ -1926,6 +2130,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         candidates = draft_tokens
+        think_acceptance = self._prepare_think_acceptance(
+            batch,
+            candidates,
+            logits_output.next_token_logits,
+            sampling_info,
+        )
+        force_accept_mask = None
+        if self.think_accept_mode == "active" and think_acceptance is not None:
+            candidate_force_mask = think_acceptance["force_mask"]
+            if bool(candidate_force_mask.any().item()):
+                force_accept_mask = candidate_force_mask
         new_seq_lens = None
         target_predict = None
         if self._selector_sample is not None:
@@ -1937,6 +2152,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
+                force_accept_mask=force_accept_mask,
             )
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif (
@@ -1950,13 +2166,31 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+                force_accept_mask=force_accept_mask,
             )
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
-            if self._use_triton_accept_bonus:
+            relaxed_greedy = (
+                self.think_accept_mode == "active"
+                and force_accept_mask is not None
+                and think_acceptance is not None
+            )
+            if relaxed_greedy:
+                greedy_accept_len = think_acceptance["relaxed_len"]
+                greedy_bonus = target_predict[
+                    torch.arange(bs, device=target_predict.device), greedy_accept_len
+                ]
+            else:
+                greedy_accept_len, greedy_bonus = (
+                    compute_dflash_correct_drafts_and_bonus(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                    )
+                )
+            if self._use_triton_accept_bonus and not relaxed_greedy:
                 try:
                     (
                         accept_len,
@@ -1981,10 +2215,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
                         e,
                     )
-                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
-                        candidates=candidates,
-                        target_predict=target_predict,
-                    )
+                    accept_len, bonus = greedy_accept_len, greedy_bonus
                     commit_lens = accept_len.to(torch.int32) + 1  # [bs]
                     out_tokens = torch.empty(
                         (bs, int(self.block_size)),
@@ -2000,10 +2231,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                     )
             else:
-                accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
-                    candidates=candidates,
-                    target_predict=target_predict,
-                )
+                accept_len, bonus = greedy_accept_len, greedy_bonus
                 commit_lens = accept_len.to(torch.int32) + 1  # [bs]
                 out_tokens = torch.empty(
                     (bs, int(self.block_size)), dtype=torch.int64, device=device
@@ -2015,6 +2243,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
+        self._record_think_acceptance(batch, think_acceptance, accept_len)
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(

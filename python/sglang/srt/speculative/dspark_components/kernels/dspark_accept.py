@@ -40,6 +40,7 @@ class AcceptSampling:
         gamma: int,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        force_accept_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling(
             candidates=candidates,
@@ -49,6 +50,7 @@ class AcceptSampling:
             draft_input=draft_input,
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
+            force_accept_mask=force_accept_mask,
             cutoff_verify_lens=cutoff_verify_lens,
         )
 
@@ -64,6 +66,7 @@ class AcceptSampling:
         gamma: int,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        force_accept_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling_triton(
             candidates=candidates,
@@ -73,6 +76,7 @@ class AcceptSampling:
             draft_input=draft_input,
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
+            force_accept_mask=force_accept_mask,
             cutoff_verify_lens=cutoff_verify_lens,
         )
 
@@ -87,6 +91,7 @@ def _accept_sampling_core(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
+    force_accept_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -105,6 +110,23 @@ def _accept_sampling_core(
             max_top_k=draft_input.max_top_k,
             uniform_top_k_value=draft_input.uniform_top_k_value,
         )
+    if force_accept_mask is not None:
+        expected_force_shape = (bs, max(int(verify_num_draft_tokens) - 1, 0))
+        if tuple(force_accept_mask.shape) != expected_force_shape:
+            raise ValueError(
+                "force_accept_mask must have shape [batch_size, verify_num_draft_tokens - 1], "
+                f"got {tuple(force_accept_mask.shape)} for {expected_force_shape}"
+            )
+        if force_accept_mask.device != device:
+            raise ValueError("force_accept_mask must be on the candidates device")
+        if expected_force_shape[1]:
+            candidate_ids = candidates[:, 1:].to(dtype=torch.long)
+            target_candidate_probs = target_probs[:, :-1].gather(
+                -1, candidate_ids.unsqueeze(-1)
+            ).squeeze(-1)
+            # Top-k/top-p can assign exact zero probability to a near-top raw-logit
+            # candidate. Never bypass that explicit sampling support restriction.
+            force_accept_mask = force_accept_mask & target_candidate_probs.gt(0)
     (
         retrieve_index,
         retrieve_next_token,
@@ -134,6 +156,7 @@ def _accept_sampling_core(
         threshold_single=1.0,
         threshold_acc=1.0,
         deterministic=True,
+        force_accept_mask=force_accept_mask,
     )
     correct_len = accept_token_num
     if cutoff_verify_lens is not None:
@@ -155,6 +178,7 @@ def accept_sampling(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    force_accept_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -166,6 +190,7 @@ def accept_sampling(
         draft_input=draft_input,
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
+        force_accept_mask=force_accept_mask,
         cutoff_verify_lens=cutoff_verify_lens,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
@@ -223,6 +248,7 @@ def accept_sampling_triton(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    force_accept_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
         candidates=candidates,
@@ -232,6 +258,7 @@ def accept_sampling_triton(
         draft_input=draft_input,
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
+        force_accept_mask=force_accept_mask,
         cutoff_verify_lens=cutoff_verify_lens,
     )
     bonus = gather_two_level_bonus_triton(

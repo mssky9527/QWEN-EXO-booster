@@ -84,6 +84,7 @@ _QWEN38_REASONING_EFFORT_ALIASES = {
     "high": "xhigh",
     "max": "xhigh",
 }
+_QWEN_EXO_DFLASH_THINK_PHASE = "qwen_exo_dflash_think_phase"
 
 
 def _normalize_model_reasoning_effort(tokenizer: Any, effort):
@@ -762,6 +763,10 @@ class OpenAIServingChat(OpenAIServingBase):
             request
         )
         require_reasoning = self._get_reasoning_from_request(request)
+        sampling_custom_params = dict(sampling_params.get("custom_params") or {})
+        sampling_custom_params[_QWEN_EXO_DFLASH_THINK_PHASE] = bool(require_reasoning)
+        sampling_params = dict(sampling_params)
+        sampling_params["custom_params"] = sampling_custom_params
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,

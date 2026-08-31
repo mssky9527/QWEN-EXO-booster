@@ -818,6 +818,10 @@ class Scheduler(
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        if self.spec_algorithm.is_dflash():
+            set_think_end_id = getattr(self.draft_worker, "set_think_end_id", None)
+            if callable(set_think_end_id):
+                set_think_end_id(self.model_config.think_end_id)
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -4817,6 +4821,17 @@ class Scheduler(
                 self.metrics_reporter.spec_total_num_accept_tokens
                 / self.metrics_reporter.spec_total_num_forward_ct
             )
+
+        if self.spec_algorithm.is_dflash() and self.draft_worker is not None:
+            dump_think_stats = getattr(
+                self.draft_worker, "dump_think_accept_stats", None
+            )
+            if callable(dump_think_stats):
+                think_stats = dump_think_stats()
+                think_stats["last_gen_throughput"] = float(
+                    self.metrics_reporter.last_gen_throughput
+                )
+                ret["dflash_think_accept"] = think_stats
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict

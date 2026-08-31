@@ -95,6 +95,8 @@ logger = logging.getLogger(__name__)
 _QWEN_EXO_SELF_CHECK_START = "<qwen_exo_self_check>"
 _QWEN_EXO_SELF_CHECK_END = "</qwen_exo_self_check>"
 
+_QWEN_EXO_DFLASH_THINK_PHASE = "qwen_exo_dflash_think_phase"
+
 
 class _QwenExoSelfAskSpillRouter:
     """Keeps phase-two Self-Ask continuations in the reasoning channel."""
@@ -3532,6 +3534,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if raw_request is not None
                 else None
             )
+            phase_custom_params = dict(sampling_params.get("custom_params") or {})
+            phase_custom_params[_QWEN_EXO_DFLASH_THINK_PHASE] = bool(
+                thinking_enabled
+                and qwen_exo_runtime is not None
+                and getattr(qwen_exo_runtime, "think_context_enabled", False)
+            )
+            sampling_params = self._copy_sampling_params(
+                sampling_params, custom_params=phase_custom_params
+            )
+            adapted_request = replace(adapted_request, sampling_params=sampling_params)
             replay_prompt = (
                 adapted_request.input_ids
                 if adapted_request.input_ids is not None
@@ -3795,6 +3807,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                         if forced_reasoning_boundary
                         else len(combined_prefix_ids)
                     ),
+                )
+                continuation_custom_params = dict(
+                    continuation_sampling_params.get("custom_params") or {}
+                )
+                continuation_custom_params[_QWEN_EXO_DFLASH_THINK_PHASE] = False
+                continuation_sampling_params = self._copy_sampling_params(
+                    continuation_sampling_params,
+                    custom_params=continuation_custom_params,
                 )
                 continuation_request = replace(
                     adapted_request,

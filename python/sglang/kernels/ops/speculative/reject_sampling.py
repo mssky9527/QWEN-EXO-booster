@@ -14,6 +14,7 @@ def speculative_sampling_classic_kernel(
     UniformSamplesFinal,
     TargetProbs,
     DraftProbs,
+    ForceAcceptMask,
     # Strides
     stride_cand_b,
     stride_cand_s,
@@ -27,10 +28,13 @@ def speculative_sampling_classic_kernel(
     stride_dp_b,
     stride_dp_s,
     stride_dp_v,
+    stride_force_b,
+    stride_force_s,
     # Constants
     NUM_SLOTS: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    FORCE_ACCEPT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     cur_prob_row = 0
@@ -67,8 +71,13 @@ def speculative_sampling_classic_kernel(
         q = tl.load(DraftProbs + offset_draft)
 
         coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
+        force_accept = 0
+        if FORCE_ACCEPT:
+            force_accept = tl.load(
+                ForceAcceptMask + pid * stride_force_b + (step - 1) * stride_force_s
+            )
 
-        if coin * q < p:
+        if force_accept > 0 or coin * q < p:
             num_accept += 1
             cur_prob_row = step
             tl.store(Predicts + last_accepted_global_idx, draft_token)
@@ -171,9 +180,25 @@ def chain_speculative_sampling_triton(
     threshold_single,
     threshold_acc,
     deterministic,  # not used
+    force_accept_mask=None,
 ):
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
+    use_force_accept = force_accept_mask is not None
+    if use_force_accept:
+        expected_shape = (batch_size, max(num_slots - 1, 0))
+        if tuple(force_accept_mask.shape) != expected_shape:
+            raise ValueError(
+                "force_accept_mask must have shape [batch_size, num_slots - 1], "
+                f"got {tuple(force_accept_mask.shape)} for {expected_shape}"
+            )
+        if force_accept_mask.device != candidates.device:
+            raise ValueError("force_accept_mask must be on the candidates device")
+        force_accept_mask = force_accept_mask.contiguous()
+    else:
+        # The pointer is not loaded when FORCE_ACCEPT=False. Reuse an existing
+        # device tensor to keep the unchanged path allocation-free.
+        force_accept_mask = target_probs
 
     grid = (batch_size,)
     speculative_sampling_classic_kernel[grid](
@@ -186,6 +211,7 @@ def chain_speculative_sampling_triton(
         uniform_samples_for_final_sampling,
         target_probs,
         draft_probs,
+        force_accept_mask,
         candidates.stride(0),
         candidates.stride(1),
         retrive_index.stride(0),
@@ -198,7 +224,10 @@ def chain_speculative_sampling_triton(
         draft_probs.stride(0),
         draft_probs.stride(1),
         draft_probs.stride(2),
+        force_accept_mask.stride(0) if use_force_accept else 0,
+        force_accept_mask.stride(1) if use_force_accept else 0,
         NUM_SLOTS=num_slots,
         VOCAB_SIZE=vocab_size,
+        FORCE_ACCEPT=use_force_accept,
         BLOCK_V=4096,
     )

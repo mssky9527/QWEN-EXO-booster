@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -17,11 +18,18 @@ from sglang.srt.utils import is_cuda, is_musa
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 QWEN_EXO_DFLASH_MODE_KEY = "qwen_exo_dflash"
 QWEN_EXO_DFLASH_ELIGIBLE = "eligible"
+QWEN_EXO_DFLASH_THINK_ACCEPT_MODE_KEY = "qwen_exo_dflash_think_accept_mode"
+QWEN_EXO_DFLASH_THINK_ACCEPT_PROBABILITY_KEY = (
+    "qwen_exo_dflash_think_accept_probability"
+)
+QWEN_EXO_DFLASH_THINK_PHASE_KEY = "qwen_exo_dflash_think_phase"
+DFLASH_THINK_ACCEPT_MODES = frozenset({"off", "shadow", "active"})
 
 
 logger = logging.getLogger(__name__)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
+_DFLASH_TARGET_SAMPLING_KERNEL_ARGUMENT_COUNT = 0
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
@@ -44,6 +52,9 @@ if is_cuda() or is_musa():
         )
 
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+        _DFLASH_TARGET_SAMPLING_KERNEL_ARGUMENT_COUNT = len(
+            torch.ops.sgl_kernel.tree_speculative_sampling_target_only.default._schema.arguments
+        )
     except Exception:
         top_k_renorm_prob = None
         top_p_renorm_prob = None
@@ -56,6 +67,66 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def _run_dflash_target_only_sampling(
+    *,
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+    deterministic: bool,
+) -> None:
+    """Invoke the installed target-only sampling op across sgl-kernel ABIs."""
+    if _DFLASH_TARGET_SAMPLING_KERNEL_ARGUMENT_COUNT >= 15:
+        stream = (
+            torch.musa.current_stream().musa_stream
+            if is_musa()
+            else torch.cuda.current_stream().cuda_stream
+        )
+        torch.ops.sgl_kernel.tree_speculative_sampling_target_only.default(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            uniform_samples,
+            uniform_samples_for_final_sampling,
+            target_probs,
+            draft_probs,
+            threshold_single,
+            threshold_acc,
+            deterministic,
+            stream,
+        )
+        return
+    tree_speculative_sampling_target_only(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc,
+        deterministic=deterministic,
+    )
 
 
 def scale_kv_cell_size_per_token_for_dflash(
@@ -649,6 +720,102 @@ def compute_dflash_correct_drafts_and_bonus(
     return correct_len, bonus.to(torch.int64)
 
 
+def dflash_think_acceptance_mask(
+    *,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    think_mask: torch.Tensor,
+    probability_threshold: float,
+    temperatures: Optional[torch.Tensor] = None,
+    target_max_logits: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a Think-only force-accept mask from target logit confidence.
+
+    The confidence is the candidate's probability relative to the highest
+    probability at the same target position:
+    ``exp((candidate_logit - max_logit) / temperature)``.  A threshold of
+    ``0.60`` therefore admits a near-top candidate without changing body
+    decoding.  This is intentionally non-lossless and is only used by the
+    explicit DFLASH experiment mode.
+
+    Returns ``(force_accept_mask, relative_probability)`` for the ``gamma``
+    draft positions.  The mask is ``[bs, block_size - 1]`` and already
+    includes the caller's Think/answer phase mask.
+    """
+    if candidates.ndim != 2:
+        raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
+    if target_logits.ndim != 2:
+        raise ValueError(
+            f"target_logits must be 2D, got shape={tuple(target_logits.shape)}"
+        )
+    bs, block_size = candidates.shape
+    if bs < 1 or block_size < 1:
+        raise ValueError("candidates must have positive batch and block dimensions")
+    if target_logits.shape[0] != bs * block_size:
+        raise ValueError(
+            "target_logits row count must equal batch_size * block_size, "
+            f"got {target_logits.shape[0]} for {bs * block_size}"
+        )
+    threshold = float(probability_threshold)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            f"probability_threshold must be finite and within [0, 1], got {threshold}"
+        )
+    gamma = block_size - 1
+    if gamma == 0:
+        empty_mask = torch.empty((bs, 0), dtype=torch.bool, device=candidates.device)
+        empty_ratio = torch.empty(
+            (bs, 0), dtype=torch.float32, device=candidates.device
+        )
+        return empty_mask, empty_ratio
+    if think_mask.shape != (bs, gamma):
+        raise ValueError(
+            "think_mask must have shape [batch_size, block_size - 1], "
+            f"got {tuple(think_mask.shape)} for {(bs, gamma)}"
+        )
+    if think_mask.device != candidates.device:
+        raise ValueError("think_mask must be on the candidates device")
+    logits = target_logits.reshape(bs, block_size, -1)[:, :-1]
+    candidate_ids = candidates[:, 1:].to(dtype=torch.long)
+    candidate_logits = logits.gather(-1, candidate_ids.unsqueeze(-1)).squeeze(-1)
+    if target_max_logits is None:
+        max_logits = logits.amax(dim=-1)
+    else:
+        if target_max_logits.shape != (bs, gamma):
+            raise ValueError(
+                "target_max_logits must have shape [batch_size, block_size - 1], "
+                f"got {tuple(target_max_logits.shape)} for {(bs, gamma)}"
+            )
+        if target_max_logits.device != candidates.device:
+            raise ValueError("target_max_logits must be on the candidates device")
+        max_logits = target_max_logits
+    candidate_logits = candidate_logits.float()
+    max_logits = max_logits.float()
+    if temperatures is None:
+        temperature = torch.ones(
+            (bs, 1), device=logits.device, dtype=torch.float32
+        )
+    else:
+        if temperatures.numel() != bs:
+            raise ValueError(
+                f"temperatures must contain one value per request, got {temperatures.numel()} for {bs}"
+            )
+        temperature = temperatures.reshape(bs, 1).to(
+            device=logits.device, dtype=torch.float32
+        )
+        temperature = temperature.clamp_min(1e-5)
+    relative_probability = torch.exp(
+        ((candidate_logits - max_logits) / temperature).clamp(min=-80.0, max=0.0)
+    )
+    relative_probability = torch.nan_to_num(
+        relative_probability, nan=0.0, posinf=1.0, neginf=0.0
+    )
+    force_accept_mask = think_mask.to(dtype=torch.bool) & (
+        relative_probability >= threshold
+    )
+    return force_accept_mask, relative_probability
+
+
 def compute_dflash_sampling_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
@@ -661,6 +828,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples: Optional[torch.Tensor] = None,
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
+    force_accept_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
@@ -697,6 +865,15 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             f"got {candidates.device} and {next_token_logits.device}."
         )
 
+    if force_accept_mask is not None:
+        expected_force_shape = (bs, max(draft_token_num - 1, 0))
+        if tuple(force_accept_mask.shape) != expected_force_shape:
+            raise ValueError(
+                "force_accept_mask must have shape [batch_size, draft_token_num - 1], "
+                f"got {tuple(force_accept_mask.shape)} for {expected_force_shape}"
+            )
+        if force_accept_mask.device != candidates.device:
+            raise ValueError("force_accept_mask must be on the candidates device")
     if threshold_single is None:
         from sglang.srt.runtime_context import get_server_args
 
@@ -763,22 +940,45 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     candidates_i64 = (
         candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
     )
-    tree_speculative_sampling_target_only(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
+    if force_accept_mask is None:
+        _run_dflash_target_only_sampling(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=True,
+        )
+    else:
+        from sglang.kernels.ops.speculative.reject_sampling import (
+            chain_speculative_sampling_triton,
+        )
+
+        chain_speculative_sampling_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=True,
+            force_accept_mask=force_accept_mask,
+        )
 
     correct_len = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
