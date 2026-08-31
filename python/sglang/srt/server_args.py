@@ -3206,7 +3206,7 @@ class ServerArgs:
     qwen_exo_score_bias_min_relevance: A[
         float,
         "Minimum Attention-Q/K relevance for trajectory recovery.",
-    ] = 0.0
+    ] = 0.01
     qwen_exo_score_bias_relevance_margin: A[
         float,
         "Minimum aggregate relevance margin over the first rejected block.",
@@ -3214,7 +3214,7 @@ class ServerArgs:
     qwen_exo_score_bias_anchor_bias: A[
         float,
         "Small positive bias reserved for original system-instruction and tool-schema anchor spans.",
-    ] = 0.0
+    ] = 0.01
     qwen_exo_score_bias_anchor_max_blocks: A[
         int,
         "Maximum system-instruction and tool-schema anchor spans carried into decode attention.",

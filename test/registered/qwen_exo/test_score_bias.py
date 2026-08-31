@@ -592,7 +592,7 @@ def test_runtime_builds_tool_schema_anchor_spans_alongside_system():
     assert runtime.telemetry.events[-1][2]["tool_schema_anchor_span_count"] == 1
 
 
-def test_runtime_tool_schema_anchor_is_opt_in_by_anchor_bias():
+def test_runtime_tool_schema_anchor_can_be_disabled_with_explicit_zero():
     import json
     from collections import OrderedDict
     from types import SimpleNamespace

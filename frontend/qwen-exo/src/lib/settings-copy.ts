@@ -224,7 +224,7 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
   ],
   qwen_exo_score_bias_min_relevance: [
     "轨迹相关性下限",
-    "要求历史块与当前查询的余弦相关性达到该值才参与控制，推荐 0.0。",
+    "要求历史块与当前查询的余弦相关性达到该值才参与控制；默认 0.01，设为 0 可关闭正相关门槛。",
   ],
   qwen_exo_score_bias_relevance_margin: [
     "轨迹相关性边际",
@@ -236,7 +236,7 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
   ],
   qwen_exo_score_bias_anchor_bias: [
     "系统/工具锚点偏置",
-    "对 system instructions 与工具 schema 的少量 token span 提供有界保护；默认关闭，建议先用 0.01 做对照。",
+    "对 system instructions 与工具 schema 的少量 token span 提供有界保护；默认 0.01，设为 0 才关闭。",
   ],
   qwen_exo_score_bias_anchor_max_blocks: [
     "系统/工具锚点块数",

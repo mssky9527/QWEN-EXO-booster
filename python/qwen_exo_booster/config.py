@@ -110,7 +110,7 @@ class QwenExoConfig:
     response_compaction_max_dropped_items: int = 16
     response_compaction_max_output_tokens: int = 2048
     score_bias_mode: str = "off"
-    score_bias_min_relevance: float = 0.0
+    score_bias_min_relevance: float = 0.01
 
     score_bias_min_surprisal: float = 0.8
     score_bias_max: float = 0.05
@@ -123,7 +123,7 @@ class QwenExoConfig:
     score_bias_selected_blocks: int = 2
     score_bias_query_window: int = 8
     score_bias_relevance_margin: float = 0.005
-    score_bias_anchor_bias: float = 0.0
+    score_bias_anchor_bias: float = 0.01
     score_bias_anchor_max_blocks: int = 2
     latent_transplant_enabled: bool = False
     latent_transplant_strength: float = 0.05
@@ -658,13 +658,13 @@ class QwenExoConfig:
                 getattr(server_args, "qwen_exo_score_bias_query_window", 8)
             ),
             score_bias_min_relevance=float(
-                getattr(server_args, "qwen_exo_score_bias_min_relevance", 0.0)
+                getattr(server_args, "qwen_exo_score_bias_min_relevance", 0.01)
             ),
             score_bias_relevance_margin=float(
                 getattr(server_args, "qwen_exo_score_bias_relevance_margin", 0.005)
             ),
             score_bias_anchor_bias=float(
-                getattr(server_args, "qwen_exo_score_bias_anchor_bias", 0.0)
+                getattr(server_args, "qwen_exo_score_bias_anchor_bias", 0.01)
             ),
             score_bias_anchor_max_blocks=int(
                 getattr(server_args, "qwen_exo_score_bias_anchor_max_blocks", 2)

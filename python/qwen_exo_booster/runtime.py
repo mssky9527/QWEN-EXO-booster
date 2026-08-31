@@ -3107,7 +3107,10 @@ class QwenExoRuntime:
                 seen_spans.add(span)
                 spans.append({"start": chunk_start, "end": chunk_end, "source": source})
 
-        anchor_bias = float(getattr(self.config, "score_bias_anchor_bias", 0.0) or 0.0)
+        configured_anchor_bias = getattr(self.config, "score_bias_anchor_bias", 0.01)
+        anchor_bias = (
+            0.01 if configured_anchor_bias is None else float(configured_anchor_bias)
+        )
         anchor_limit = max(
             0, int(getattr(self.config, "score_bias_anchor_max_blocks", 2))
         )

@@ -230,6 +230,19 @@ def test_trajectory_score_bias_defaults_are_bounded_and_public(tmp_path):
     assert config.score_bias_tail_tokens == 4096
     assert config.score_bias_selected_blocks == 2
     assert config.public_dict()["score_bias_tail_ratio"] == 0.15
+    assert config.score_bias_min_relevance == 0.01
+    assert config.score_bias_anchor_bias == 0.01
+
+    explicit_zero = QwenExoConfig.from_server_args(
+        server_args(
+            tmp_path,
+            qwen_exo_score_bias_mode="trajectory_shadow",
+            qwen_exo_score_bias_min_relevance=0.0,
+            qwen_exo_score_bias_anchor_bias=0.0,
+        )
+    )
+    assert explicit_zero.score_bias_min_relevance == 0.0
+    assert explicit_zero.score_bias_anchor_bias == 0.0
 
     with pytest.raises(ValueError, match="score_bias_mode"):
         QwenExoConfig.from_server_args(

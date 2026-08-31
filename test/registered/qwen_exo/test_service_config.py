@@ -28,6 +28,17 @@ def test_tensor_bank_defaults_reserve_context_and_full_attention_capacity():
         validate_values(values)
 
 
+def test_score_bias_defaults_enable_anchor_and_positive_relevance_floor():
+    values = default_values()
+
+    assert values["qwen_exo_score_bias_anchor_bias"] == 0.01
+    assert values["qwen_exo_score_bias_min_relevance"] == 0.01
+
+    validated = validate_values(values)
+    assert validated["qwen_exo_score_bias_anchor_bias"] == 0.01
+    assert validated["qwen_exo_score_bias_min_relevance"] == 0.01
+
+
 def test_default_thinking_settings_map_to_chat_template_kwargs():
     values = default_values()
     assert values["default_enable_thinking"] is False

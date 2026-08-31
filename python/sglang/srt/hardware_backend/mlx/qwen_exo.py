@@ -223,7 +223,7 @@ class MlxQwenExoRuntime:
             ),
         )
         self.min_relevance = float(
-            getattr(self.server_args, "qwen_exo_score_bias_min_relevance", 0.0)
+            getattr(self.server_args, "qwen_exo_score_bias_min_relevance", 0.01)
         )
         self.relevance_margin = float(
             getattr(self.server_args, "qwen_exo_score_bias_relevance_margin", 0.005)

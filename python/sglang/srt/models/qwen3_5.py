@@ -843,13 +843,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     getattr(server_args, "qwen_exo_score_bias_query_window", 8)
                 ),
                 score_bias_min_relevance=float(
-                    getattr(server_args, "qwen_exo_score_bias_min_relevance", 0.0)
+                    getattr(server_args, "qwen_exo_score_bias_min_relevance", 0.01)
                 ),
                 score_bias_relevance_margin=float(
                     getattr(server_args, "qwen_exo_score_bias_relevance_margin", 0.005)
                 ),
                 score_bias_anchor_bias=float(
-                    getattr(server_args, "qwen_exo_score_bias_anchor_bias", 0.0)
+                    getattr(server_args, "qwen_exo_score_bias_anchor_bias", 0.01)
                 ),
                 score_bias_anchor_max_blocks=int(
                     getattr(server_args, "qwen_exo_score_bias_anchor_max_blocks", 2)
@@ -1220,7 +1220,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 key_sketches,
                 limit=shortlist_limit,
                 min_score=float(
-                    getattr(server_args, "qwen_exo_score_bias_min_relevance", 0.0)
+                    getattr(
+                        server_args,
+                        "qwen_exo_score_bias_min_relevance",
+                        0.01,
+                    )
                 ),
                 margin=float(
                     getattr(
@@ -1245,7 +1249,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     getattr(server_args, "qwen_exo_score_bias_query_window", 8)
                 ),
                 min_score=float(
-                    getattr(server_args, "qwen_exo_score_bias_min_relevance", 0.0)
+                    getattr(
+                        server_args,
+                        "qwen_exo_score_bias_min_relevance",
+                        0.01,
+                    )
                 ),
                 margin=float(
                     getattr(
