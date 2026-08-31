@@ -92,10 +92,10 @@ class TestDflashThinkAcceptanceTelemetry(CustomTestCase):
     def test_phase_mask_stops_at_think_end_and_root_boundary(self):
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
-        worker = SimpleNamespace(
-            model_runner=SimpleNamespace(
-                model_config=SimpleNamespace(think_end_id=9)
-            )
+        worker = object.__new__(DFlashWorkerV2)
+        worker.think_end_id = 9
+        worker.model_runner = SimpleNamespace(
+            model_config=SimpleNamespace(think_end_id=9)
         )
         batch = SimpleNamespace(
             reqs=[
@@ -124,6 +124,45 @@ class TestDflashThinkAcceptanceTelemetry(CustomTestCase):
             without_boundary, torch.tensor([[False, False, False]])
         )
 
+
+    def test_exact_threshold_hits_are_not_sent_as_force_accepts(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        worker = object.__new__(DFlashWorkerV2)
+        worker.think_accept_mode = "active"
+        worker.think_accept_probability = 0.60
+        worker.think_end_id = 9
+        worker.model_runner = SimpleNamespace(
+            model_config=SimpleNamespace(think_end_id=9)
+        )
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(
+                    sampling_params=SimpleNamespace(
+                        custom_params={"qwen_exo_dflash_think_phase": True}
+                    )
+                )
+            ]
+        )
+        candidates = torch.tensor([[11, 2, 3]])
+        target_logits = torch.tensor(
+            [[0.0, 0.0, 1.0, -4.0], [1.0, 0.0, -4.0, 0.5], [0.0, 1.0, 0.0, 0.0]]
+        )
+
+        experiment = DFlashWorkerV2._prepare_think_acceptance(
+            worker, batch, candidates, target_logits, None
+        )
+
+        torch.testing.assert_close(
+            experiment["threshold_mask"], torch.tensor([[True, True]])
+        )
+        torch.testing.assert_close(
+            experiment["force_mask"], torch.tensor([[False, True]])
+        )
+        torch.testing.assert_close(experiment["strict_len"], torch.tensor([1]))
+        torch.testing.assert_close(experiment["relaxed_len"], torch.tensor([2]))
+
+
     def test_dump_reports_rates_and_draft_token_gain(self):
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
@@ -132,6 +171,7 @@ class TestDflashThinkAcceptanceTelemetry(CustomTestCase):
                 "verify_ct": 2,
                 "think_request_ct": 2,
                 "candidate_ct": 10,
+                "threshold_hit_ct": 6,
                 "force_accept_ct": 4,
                 "force_nonexact_ct": 3,
                 "strict_draft_tokens": 5,
@@ -147,6 +187,7 @@ class TestDflashThinkAcceptanceTelemetry(CustomTestCase):
         self.assertEqual(stats["mode"], "shadow")
         self.assertEqual(stats["verify_ct"], 2)
         self.assertAlmostEqual(stats["force_accept_rate"], 0.4)
+        self.assertAlmostEqual(stats["threshold_hit_rate"], 0.6)
         self.assertAlmostEqual(stats["force_nonexact_rate"], 0.3)
         self.assertEqual(stats["relaxed_gain_draft_tokens"], 4)
         self.assertEqual(stats["actual_gain_draft_tokens"], 3)

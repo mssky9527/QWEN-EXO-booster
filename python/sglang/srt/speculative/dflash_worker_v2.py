@@ -314,6 +314,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             "verify_ct": 0,
             "think_request_ct": 0,
             "candidate_ct": 0,
+            "threshold_hit_ct": 0,
             "force_accept_ct": 0,
             "force_nonexact_ct": 0,
             "strict_draft_tokens": 0,
@@ -1650,7 +1651,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if sampling_info is not None
             else None
         )
-        force_mask, relative_probability = dflash_think_acceptance_mask(
+        threshold_mask, relative_probability = dflash_think_acceptance_mask(
             candidates=candidates,
             target_logits=target_logits,
             think_mask=think_mask,
@@ -1659,9 +1660,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_max_logits=target_max_logits[:, :-1],
         )
         strict_matches = candidates[:, 1:] == target_predict[:, :-1]
+        force_mask = threshold_mask & ~strict_matches
         relaxed_matches = strict_matches | force_mask
         return {
             "think_mask": think_mask,
+            "threshold_mask": threshold_mask,
             "force_mask": force_mask,
             "relative_probability": relative_probability,
             "strict_len": self._prefix_accept_lengths(strict_matches),
@@ -1678,12 +1681,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         if experiment is None:
             return
         force_mask = experiment["force_mask"]
+        threshold_mask = experiment["threshold_mask"]
         strict_matches = experiment["strict_matches"]
         think_mask = experiment["think_mask"]
         values = {
             "verify_ct": 1,
             "think_request_ct": int(think_mask.any(dim=1).sum().item()),
             "candidate_ct": int(think_mask.sum().item()),
+            "threshold_hit_ct": int(threshold_mask.sum().item()),
             "force_accept_ct": int(force_mask.sum().item()),
             "force_nonexact_ct": int((force_mask & ~strict_matches).sum().item()),
             "strict_draft_tokens": int(experiment["strict_len"].sum().item()),
@@ -1695,12 +1700,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.ps.tp_rank == 0:
             logger.info(
                 "DFLASH Think probability acceptance: mode=%s threshold=%.3f "
-                "batch=%d candidates=%d force=%d force_nonexact=%d "
+                "batch=%d candidates=%d threshold_hit=%d force=%d force_nonexact=%d "
                 "strict_len=%d relaxed_len=%d actual_len=%d",
                 self.think_accept_mode,
                 self.think_accept_probability,
                 len(batch.reqs),
                 values["candidate_ct"],
+                values["threshold_hit_ct"],
                 values["force_accept_ct"],
                 values["force_nonexact_ct"],
                 values["strict_draft_tokens"],
@@ -1714,6 +1720,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         result["probability_threshold"] = self.think_accept_probability
         verify_ct = int(result["verify_ct"])
         candidate_ct = int(result["candidate_ct"])
+        result["threshold_hit_rate"] = (
+            int(result["threshold_hit_ct"]) / candidate_ct if candidate_ct else 0.0
+        )
         result["force_accept_rate"] = (
             int(result["force_accept_ct"]) / candidate_ct if candidate_ct else 0.0
         )
