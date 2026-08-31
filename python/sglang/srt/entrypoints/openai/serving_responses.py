@@ -3499,6 +3499,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 max(int(configured_max) - consumed_tokens, 1),
             )
         return self._copy_sampling_params(sampling_params, max_new_tokens=remaining)
+
     async def _generate_with_builtin_tools(
         self,
         request_id: str,
@@ -3801,6 +3802,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                     input_ids=continuation_prompt_ids,
                     sampling_params=continuation_sampling_params,
                 )
+                if score_bias_logprob_start_len is not None:
+                    # Keep the phase-one logprob window on phase two. With
+                    # return_logprob enabled, the default zero would cap the
+                    # radix match at zero and force a full prompt re-prefill.
+                    continuation_request = replace(
+                        continuation_request,
+                        logprob_start_len=score_bias_logprob_start_len,
+                    )
                 if hasattr(context, "num_processed_tokens"):
                     context.num_processed_tokens = 0
                 continuation_output_ids: list[int] = []

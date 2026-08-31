@@ -123,11 +123,6 @@ _GROUPS = (
         "description": "当外部知识均未通过准入时，仅使用最新工具结果中的可验证事实补全当前请求。",
     },
     {
-        "id": "context_integrity",
-        "label": "上下文完整性",
-        "description": "由模型将最新工具内容与最近会话上下文进行语义对照；预算自动取模型最大上下文的配置分之一。",
-    },
-    {
         "id": "reflection_memory",
         "label": "反思记忆",
         "description": "在工具轨迹空闲后提炼可复用经验，热写入知识库并重建原生 Tensor Bank。",
@@ -827,8 +822,8 @@ SERVICE_SETTINGS = (
     _setting(
         "qwen_exo_score_bias_anchor_bias",
         "score_bias",
-        "系统锚点偏置",
-        "作用：对原始 system instructions 的少量 token span 提供有界保护，避免轨迹偏置造成约束漂移。默认关闭；建议先用 0.01 做对照。",
+        "系统/工具锚点偏置",
+        "作用：对原始 system instructions 与工具 schema 的少量 token span 提供有界保护，避免轨迹偏置造成约束漂移。默认关闭；建议先用 0.01 做对照。",
         "number",
         0.0,
         minimum=0,
@@ -838,8 +833,8 @@ SERVICE_SETTINGS = (
     _setting(
         "qwen_exo_score_bias_anchor_max_blocks",
         "score_bias",
-        "系统锚点块数",
-        "作用：系统 instructions 参与 decode 锚定的最多 128-token 块数。",
+        "系统/工具锚点块数",
+        "作用：system instructions 与工具 schema 参与 decode 锚定的最多 128-token 块数。",
         "integer",
         2,
         minimum=1,
@@ -883,27 +878,6 @@ SERVICE_SETTINGS = (
         "active",
         choices=("off", "active"),
         choice_labels={"off": "关闭", "active": "启用"},
-    ),
-    _setting(
-        "qwen_exo_context_integrity_mode",
-        "context_integrity",
-        "完整性检查",
-        "作用：由模型根据最新工具内容和最近会话上下文审查过期事实；不按工具名称或硬编码规则判断。只在工具原文明确推翻旧结论时写入更正。默认启用。",
-        "string",
-        "active",
-        choices=("off", "active"),
-        choice_labels={"off": "关闭", "active": "启用"},
-    ),
-    _setting(
-        "qwen_exo_context_integrity_context_divisor",
-        "context_integrity",
-        "完整性上下文比例",
-        "作用：完整性检查自动使用模型最大上下文的对应分之一；默认 3，即使用三分之一。模型上下文变化时预算同步变化。",
-        "integer",
-        3,
-        minimum=2,
-        maximum=8,
-        step=1,
     ),
     _setting(
         "qwen_exo_reflection_memory_mode",
@@ -1005,11 +979,12 @@ SERVICE_SETTINGS = (
 
 _SETTINGS_BY_KEY = {setting.key: setting for setting in SERVICE_SETTINGS}
 
+# Context Integrity controls are intentionally CLI-only and experimental; they
+# are preserved in launch arguments but omitted from managed service settings.
 _SHADOW_TO_ACTIVE_KEYS = frozenset(
     {
         "qwen_exo_qk_prefilter_mode",
         "qwen_exo_context_evidence_mode",
-        "qwen_exo_context_integrity_mode",
     }
 )
 _DEFAULT_CHAT_TEMPLATE_FLAG = "--default-chat-template-kwargs"
@@ -1186,7 +1161,6 @@ def _migrate_persisted_values(raw_values: object) -> dict[str, Any]:
         for key in (
             "qwen_exo_qk_prefilter_mode",
             "qwen_exo_context_evidence_mode",
-            "qwen_exo_context_integrity_mode",
             "qwen_exo_reflection_memory_mode",
             "qwen_exo_response_compaction_mode",
         ):

@@ -65,6 +65,7 @@ class QwenExoFeatureFlags:
     policy_data: bool = True
     score_bias: bool = False
     activation_training: bool = False
+    context_integrity: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +338,10 @@ class QwenExoConfig:
             raise ValueError("Score Bias feature flag and mode disagree")
         if self.feature_flags.observer != (self.observer_mode != "off"):
             raise ValueError("Observer feature flag and observer mode disagree")
+        if self.feature_flags.context_integrity != (
+            self.context_integrity_mode != "off"
+        ):
+            raise ValueError("Context Integrity feature flag and mode disagree")
         if self.immediate_uncertainty_retrieval and self.observer_mode != "active":
             raise ValueError(
                 "Immediate uncertainty retrieval requires qwen_exo_observer_mode=active"
@@ -445,6 +450,16 @@ class QwenExoConfig:
                 raise ValueError(
                     "QWEN-EXO CUDA Score Bias requires the Triton attention backend"
                 )
+        configured_context_integrity_mode = str(
+            getattr(server_args, "qwen_exo_context_integrity_mode", "off")
+        )
+        context_integrity_enabled = (
+            bool(getattr(server_args, "qwen_exo_experimental_context_integrity", False))
+            and configured_context_integrity_mode != "off"
+        )
+        context_integrity_mode = (
+            configured_context_integrity_mode if context_integrity_enabled else "off"
+        )
         return cls(
             state_directory=Path(server_args.qwen_exo_state_dir).expanduser(),
             knowledge_directory=Path(server_args.qwen_exo_knowledge_dir).expanduser(),
@@ -512,6 +527,7 @@ class QwenExoConfig:
                         server_args, "qwen_exo_experimental_activation_training", False
                     )
                 ),
+                context_integrity=context_integrity_enabled,
             ),
             max_running_requests=int(
                 getattr(server_args, "max_running_requests", 10) or 10
@@ -565,9 +581,7 @@ class QwenExoConfig:
             context_evidence_mode=str(
                 getattr(server_args, "qwen_exo_context_evidence_mode", "off")
             ),
-            context_integrity_mode=str(
-                getattr(server_args, "qwen_exo_context_integrity_mode", "off")
-            ),
+            context_integrity_mode=context_integrity_mode,
             context_integrity_context_divisor=int(
                 getattr(server_args, "qwen_exo_context_integrity_context_divisor", 3)
             ),

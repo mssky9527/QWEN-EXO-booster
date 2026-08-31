@@ -58,6 +58,12 @@
 27b推理加速模型下载地址:
 https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2
 
+### Context Integrity（实验功能）
+
+Context Integrity 默认下线，不会随普通启动加载。只有启动时显式设置
+`QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY=1`（或传入
+`--qwen-exo-experimental-context-integrity`）才允许启用。
+
 
 ## 访问控制台
 

@@ -95,10 +95,6 @@ def test_values_round_trip_through_managed_server_args():
     assert effective_args.count("--qwen-exo-qk-recall-preset") == 1
     assert values_from_args(effective_args)["qwen_exo_qk_recall_preset"] == "strict"
     assert values_from_args(effective_args)["qwen_exo_max_output_tokens"] == 8192
-    assert (
-        values_from_args(effective_args)["qwen_exo_context_integrity_context_divisor"]
-        == 3
-    )
     assert effective_args.count("--qwen-exo-console-trace-default-scope") == 1
     assert (
         values_from_args(effective_args)["qwen_exo_console_trace_default_scope"]
@@ -193,16 +189,49 @@ def test_internal_budget_covers_reflection_retries_and_compaction():
         validate_values(values)
 
 
-def test_experimental_trajectory_training_is_hidden_from_managed_config():
+def test_experimental_features_are_hidden_from_managed_config():
     values = default_values()
 
     assert "qwen_exo_experimental_activation_training" not in values
     assert "qwen_exo_activation_editor_strength" not in values
     assert "qwen_exo_activation_editor_enabled" not in values
+    assert "qwen_exo_context_integrity_mode" not in values
+    assert "qwen_exo_context_integrity_context_divisor" not in values
 
     values["qwen_exo_experimental_activation_training"] = True
     with pytest.raises(ServiceConfigError, match="未知配置项"):
         validate_values(values)
+
+
+def test_context_integrity_controls_are_cli_only(tmp_path: Path):
+    values = default_values()
+    args = apply_values_to_args(
+        [
+            "--model-path",
+            "/models/qwen-exo",
+            "--qwen-exo-experimental-context-integrity",
+            "--qwen-exo-context-integrity-mode",
+            "active",
+            "--qwen-exo-context-integrity-context-divisor",
+            "5",
+        ],
+        values,
+    )
+
+    assert "--qwen-exo-experimental-context-integrity" in args
+    assert "--qwen-exo-context-integrity-mode" in args
+    assert "--qwen-exo-context-integrity-context-divisor" in args
+    round_trip = values_from_args(args)
+    assert "qwen_exo_context_integrity_mode" not in round_trip
+    assert "qwen_exo_context_integrity_context_divisor" not in round_trip
+
+    store = ServiceConfigStore(tmp_path / "service-config.json")
+    store.ensure([])
+    public = store.public_document()
+    assert "context_integrity" not in {group["id"] for group in public["groups"]}
+    assert all(
+        setting["group"] != "context_integrity" for setting in public["settings"]
+    )
 
 
 def test_new_runtime_features_default_active_with_distinct_groups():
@@ -210,22 +239,14 @@ def test_new_runtime_features_default_active_with_distinct_groups():
 
     assert values["qwen_exo_qk_prefilter_mode"] == "active"
     assert values["qwen_exo_context_evidence_mode"] == "active"
-    assert values["qwen_exo_context_integrity_mode"] == "active"
     assert values["qwen_exo_reflection_memory_mode"] == "active"
     assert values["qwen_exo_response_compaction_mode"] == "active"
-    assert values["qwen_exo_context_integrity_context_divisor"] == 3
 
     settings = {setting.key: setting for setting in SERVICE_SETTINGS}
     assert settings["qwen_exo_context_evidence_mode"].group == "post_tool_evidence"
-    assert settings["qwen_exo_context_integrity_mode"].group == "context_integrity"
-    assert (
-        settings["qwen_exo_context_integrity_context_divisor"].group
-        == "context_integrity"
-    )
     assert settings["qwen_exo_reflection_memory_mode"].group == "reflection_memory"
     assert settings["qwen_exo_response_compaction_mode"].group == "compaction"
     assert settings["qwen_exo_qk_prefilter_mode"].choices == ("off", "active")
-    assert settings["qwen_exo_context_integrity_mode"].choices == ("off", "active")
 
 
 def test_managed_qk_expansion_margin_defaults_to_production_rank_gate():
@@ -267,7 +288,8 @@ def test_ensure_migrates_legacy_modes_to_active_reflection_memory(tmp_path: Path
     assert migrated["revision"] != initial["revision"]
     assert migrated["values"]["qwen_exo_qk_prefilter_mode"] == "active"
     assert migrated["values"]["qwen_exo_context_evidence_mode"] == "active"
-    assert migrated["values"]["qwen_exo_context_integrity_mode"] == "active"
+    assert "qwen_exo_context_integrity_mode" not in migrated["values"]
+    assert "qwen_exo_context_integrity_context_divisor" not in migrated["values"]
     assert migrated["values"]["qwen_exo_reflection_memory_mode"] == "active"
     assert migrated["values"]["qwen_exo_reflection_memory_min_events"] == 5
     assert migrated["values"]["qwen_exo_response_compaction_mode"] == "active"

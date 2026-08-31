@@ -234,9 +234,13 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
     "工具后上下文证据",
     "外部知识均未通过准入时，只让最新工具结果中的明确事实作为当前请求的临时证据；不能证实时不注入。",
   ],
-  qwen_exo_context_integrity_mode: [
-    "完整性检查",
-    "每次工具结果到达后审查私有上下文、工具账本与执行胶囊；只准入带当前工具原文证据的更正。",
+  qwen_exo_score_bias_anchor_bias: [
+    "系统/工具锚点偏置",
+    "对 system instructions 与工具 schema 的少量 token span 提供有界保护；默认关闭，建议先用 0.01 做对照。",
+  ],
+  qwen_exo_score_bias_anchor_max_blocks: [
+    "系统/工具锚点块数",
+    "限制 system instructions 与工具 schema 参与 decode 锚定的最多 128-token 块数。",
   ],
   qwen_exo_reflection_memory_mode: [
     "反思记忆",

@@ -96,7 +96,6 @@ from qwen_exo_booster.score_bias import (
     ScoreBiasRecord,
     block_surprise_records,
     build_score_bias_payload,
-    find_first_token_span,
     find_last_token_span,
 )
 
@@ -2805,10 +2804,272 @@ class QwenExoRuntime:
             )
         return tuple({"start": block.start, "end": block.end} for block in captures)
 
+    @staticmethod
+    def _score_bias_model_dump(value: Any) -> Any:
+        if hasattr(value, "model_dump"):
+            try:
+                return value.model_dump(exclude_none=True)
+            except TypeError:
+                return value.model_dump()
+        return value
+
+    @classmethod
+    def _score_bias_system_texts(cls, request: Any) -> tuple[str, ...]:
+        texts: list[str] = []
+
+        def add(value: Any) -> None:
+            text = cls._response_item_text(value).strip()
+            if text and text not in texts:
+                texts.append(text)
+
+        add(getattr(request, "instructions", None))
+        for field in ("input", "messages"):
+            items = getattr(request, field, None)
+            if not isinstance(items, (list, tuple)):
+                continue
+            for raw_item in items:
+                item = cls._score_bias_model_dump(raw_item)
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("role") or "") not in {"system", "developer"}:
+                    continue
+                add(item.get("content", item.get("text")))
+        return tuple(texts)
+
+    @staticmethod
+    def _score_bias_tool_choice_name(request: Any) -> str:
+        choice = QwenExoRuntime._score_bias_model_dump(
+            getattr(request, "tool_choice", None)
+        )
+        if isinstance(choice, dict):
+            function = choice.get("function")
+            if isinstance(function, dict):
+                return str(function.get("name") or "").strip()
+            return str(choice.get("name") or "").strip()
+        if isinstance(choice, str) and choice not in {"auto", "required", "none"}:
+            return choice.strip()
+        return ""
+
+    @classmethod
+    def _score_bias_tool_schema_variants(
+        cls, request: Any
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        raw_tools = getattr(request, "tools", None)
+        if not isinstance(raw_tools, (list, tuple)):
+            return ()
+        entries: list[tuple[str, tuple[str, ...]]] = []
+        for raw_tool in raw_tools:
+            item = cls._score_bias_model_dump(raw_tool)
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "function") != "function":
+                continue
+            raw_function = item.get("function")
+            if isinstance(raw_function, dict):
+                function = dict(raw_function)
+            else:
+                function = {
+                    key: item[key]
+                    for key in ("name", "description", "parameters", "strict")
+                    if key in item and item[key] is not None
+                }
+            name = str(function.get("name") or item.get("name") or "").strip()
+            if not name:
+                continue
+            function.setdefault("name", name)
+            ordered_function = {
+                key: function[key]
+                for key in ("name", "description", "parameters", "strict")
+                if key in function and function[key] is not None
+            }
+            without_false_strict = {
+                key: value
+                for key, value in ordered_function.items()
+                if not (key == "strict" and value is False)
+            }
+            candidates: list[dict[str, Any]] = [
+                {"type": "function", "function": function},
+                {"type": "function", "function": ordered_function},
+                {"type": "function", "function": without_false_strict},
+            ]
+            if "function" not in item:
+                candidates.append(item)
+            variants: list[str] = []
+            for candidate in candidates:
+                try:
+                    text = json.dumps(candidate, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    continue
+                if text not in variants:
+                    variants.append(text)
+            if variants:
+                entries.append((name, tuple(variants)))
+        selected_name = cls._score_bias_tool_choice_name(request)
+        if selected_name:
+            entries.sort(key=lambda entry: entry[0] != selected_name)
+        return tuple(entries)
+
+    @staticmethod
+    def _score_bias_encode(tokenizer: Any, text: str) -> tuple[int, ...]:
+        try:
+            encoded = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            encoded = tokenizer.encode(text)
+        if hasattr(encoded, "tolist"):
+            encoded = encoded.tolist()
+        if encoded and isinstance(encoded[0], (list, tuple)):
+            encoded = encoded[0]
+        return tuple(int(token) for token in (encoded or ()))
+
+    @staticmethod
+    def _score_bias_find_first_span(
+        prompt_ids: list[int] | tuple[int, ...],
+        needle_ids: tuple[int, ...],
+        start: int = 0,
+    ) -> tuple[int, int] | None:
+        if not needle_ids or len(needle_ids) > len(prompt_ids):
+            return None
+        first = needle_ids[0]
+        lower = max(0, int(start))
+        for offset in range(lower, len(prompt_ids) - len(needle_ids) + 1):
+            if (
+                prompt_ids[offset] == first
+                and prompt_ids[offset : offset + len(needle_ids)] == needle_ids
+            ):
+                return offset, offset + len(needle_ids)
+        return None
+
+    @staticmethod
+    def _score_bias_find_span_after(
+        prompt_ids: list[int] | tuple[int, ...],
+        needle_ids: tuple[int, ...],
+        start: int,
+    ) -> tuple[int, int] | None:
+        return QwenExoRuntime._score_bias_find_first_span(
+            prompt_ids, needle_ids, start=start
+        )
+
+    @staticmethod
+    def _score_bias_anchor_blocks(
+        start: int, end: int, source: str, max_blocks: int
+    ) -> list[dict[str, int | str]]:
+        max_blocks = max(0, int(max_blocks))
+        if max_blocks < 1 or start < 0 or end <= start:
+            return []
+        chunks = [
+            (chunk_start, min(chunk_start + SCORE_BIAS_BLOCK_SIZE, end))
+            for chunk_start in range(start, end, SCORE_BIAS_BLOCK_SIZE)
+        ]
+        if len(chunks) > max_blocks:
+            chunks = (
+                chunks[:1]
+                if max_blocks == 1
+                else chunks[:1] + chunks[-(max_blocks - 1) :]
+            )
+        return [
+            {"start": int(chunk_start), "end": int(chunk_end), "source": source}
+            for chunk_start, chunk_end in chunks
+        ]
+
+    @classmethod
+    def _score_bias_system_anchor_spans(
+        cls,
+        request: Any,
+        prompt_ids: list[int] | tuple[int, ...],
+        tokenizer: Any,
+        max_blocks: int,
+    ) -> list[dict[str, int | str]]:
+        anchors: list[dict[str, int | str]] = []
+        for text in cls._score_bias_system_texts(request):
+            needle = cls._score_bias_encode(tokenizer, text)
+            span = cls._score_bias_find_first_span(prompt_ids, needle)
+            if span is None:
+                continue
+            anchors.extend(
+                cls._score_bias_anchor_blocks(span[0], span[1], "system", max_blocks)
+            )
+        return anchors
+
+    @classmethod
+    def _score_bias_tool_anchor_spans(
+        cls,
+        request: Any,
+        prompt_ids: list[int] | tuple[int, ...],
+        tokenizer: Any,
+        max_blocks: int,
+    ) -> list[dict[str, int | str]]:
+        anchors: list[dict[str, int | str]] = []
+        seen: set[tuple[int, int]] = set()
+        tool_variants = cls._score_bias_tool_schema_variants(request)
+        if not tool_variants:
+            return []
+        for _name, variants in tool_variants:
+            span = None
+            for text in variants:
+                needle = cls._score_bias_encode(tokenizer, text)
+                span = cls._score_bias_find_first_span(prompt_ids, needle)
+                if span is not None:
+                    break
+            if span is None:
+                continue
+            for anchor in cls._score_bias_anchor_blocks(
+                span[0], span[1], "tool_schema", max_blocks
+            ):
+                key = (int(anchor["start"]), int(anchor["end"]))
+                if key not in seen:
+                    seen.add(key)
+                    anchors.append(anchor)
+            if len(anchors) >= max_blocks:
+                return anchors[:max_blocks]
+        if anchors:
+            return anchors
+        marker_pairs = (
+            ("<tools>", "</tools>"),
+            ("<|tools|>", "<|/tools|>"),
+            ("<|tool|>", "<|/tool|>"),
+        )
+        for opening, closing in marker_pairs:
+            opening_ids = cls._score_bias_encode(tokenizer, opening)
+            opening_span = cls._score_bias_find_first_span(prompt_ids, opening_ids)
+            if opening_span is None:
+                continue
+            closing_ids = cls._score_bias_encode(tokenizer, closing)
+            closing_span = cls._score_bias_find_span_after(
+                prompt_ids, closing_ids, opening_span[1]
+            )
+            if closing_span is None:
+                continue
+            return cls._score_bias_anchor_blocks(
+                opening_span[0], closing_span[1], "tool_schema", max_blocks
+            )
+        return []
+
+    @staticmethod
+    def _score_bias_merge_anchor_spans(
+        system: list[dict[str, int | str]],
+        tools: list[dict[str, int | str]],
+        max_blocks: int,
+    ) -> list[dict[str, int | str]]:
+        max_blocks = max(0, int(max_blocks))
+        if max_blocks < 1:
+            return []
+        selected: list[dict[str, int | str]] = []
+        if system:
+            selected.append(system[0])
+        selected.extend(tools[: max(0, max_blocks - len(selected))])
+        for candidate in (*system, *tools):
+            if len(selected) >= max_blocks:
+                break
+            key = (candidate["start"], candidate["end"])
+            if any((item["start"], item["end"]) == key for item in selected):
+                continue
+            selected.append(candidate)
+        return selected[:max_blocks]
+
     def score_bias_user_query_payload(
         self, request: Any, prompt_ids: list[int] | tuple[int, ...]
     ) -> dict[str, Any]:
-        """Describe explicit user spans that seed the request's Bias shortlist."""
+        """Describe user, system, and tool-schema spans for Score Bias."""
 
         tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
         request_id = str(getattr(request, "request_id", "") or "")
@@ -2820,20 +3081,15 @@ class QwenExoRuntime:
         latest_text = MemoryPipeline._latest_user_text(input_value)
         text_specs = (("original", first_text, False), ("latest", latest_text, True))
         spans: list[dict[str, int | str]] = []
-        anchor_spans: list[dict[str, int | str]] = []
         seen_spans: set[tuple[int, int]] = set()
         for source, text, use_last in text_specs:
             if not text:
                 continue
-            try:
-                token_ids = tokenizer.encode(text, add_special_tokens=False)
-            except TypeError:
-                token_ids = tokenizer.encode(text)
-            needle = tuple(int(token) for token in token_ids or ())
+            needle = self._score_bias_encode(tokenizer, text)
             located = (
                 find_last_token_span(prompt, needle)
                 if use_last
-                else find_first_token_span(prompt, needle)
+                else self._score_bias_find_first_span(prompt, needle)
             )
             if located is None:
                 continue
@@ -2855,28 +3111,24 @@ class QwenExoRuntime:
         anchor_limit = max(
             0, int(getattr(self.config, "score_bias_anchor_max_blocks", 2))
         )
-        instructions = str(getattr(request, "instructions", "") or "").strip()
-        if anchor_bias > 0 and anchor_limit > 0 and instructions:
-            try:
-                instruction_ids = tokenizer.encode(
-                    instructions, add_special_tokens=False
-                )
-            except TypeError:
-                instruction_ids = tokenizer.encode(instructions)
-            instruction_needle = tuple(int(token) for token in instruction_ids or ())
-            instruction_span = find_first_token_span(prompt, instruction_needle)
-            if instruction_span is not None:
-                start, end = instruction_span
-                chunks = [
-                    (chunk_start, min(chunk_start + SCORE_BIAS_BLOCK_SIZE, end))
-                    for chunk_start in range(start, end, SCORE_BIAS_BLOCK_SIZE)
-                ]
-                if len(chunks) > anchor_limit:
-                    chunks = chunks[:1] + chunks[-(anchor_limit - 1) :]
-                anchor_spans = [
-                    {"start": chunk_start, "end": chunk_end, "source": "system"}
-                    for chunk_start, chunk_end in chunks
-                ]
+        system_anchor_spans: list[dict[str, int | str]] = []
+        tool_anchor_spans: list[dict[str, int | str]] = []
+        if anchor_bias > 0 and anchor_limit > 0:
+            system_anchor_spans = self._score_bias_system_anchor_spans(
+                request, prompt, tokenizer, anchor_limit
+            )
+            tool_anchor_spans = self._score_bias_tool_anchor_spans(
+                request, prompt, tokenizer, anchor_limit
+            )
+        anchor_spans = self._score_bias_merge_anchor_spans(
+            system_anchor_spans, tool_anchor_spans, anchor_limit
+        )
+        selected_system_anchor_count = sum(
+            item.get("source") == "system" for item in anchor_spans
+        )
+        selected_tool_anchor_count = sum(
+            item.get("source") == "tool_schema" for item in anchor_spans
+        )
         conversation_key = self._request_conversation_keys.get(request_id, "")
         sketches = self._score_bias_user_queries.get(conversation_key, ())
         if spans or sketches or anchor_spans:
@@ -2888,6 +3140,8 @@ class QwenExoRuntime:
                     {
                         "span_count": len(spans),
                         "anchor_span_count": len(anchor_spans),
+                        "system_anchor_span_count": selected_system_anchor_count,
+                        "tool_schema_anchor_span_count": selected_tool_anchor_count,
                         "sources": sorted({str(item["source"]) for item in spans}),
                         "anchor_sources": sorted(
                             {str(item["source"]) for item in anchor_spans}
@@ -2898,7 +3152,7 @@ class QwenExoRuntime:
             return {
                 "mode": self.config.score_bias_mode,
                 "spans": spans[:8],
-                "anchor_spans": anchor_spans[:anchor_limit],
+                "anchor_spans": anchor_spans,
                 "persisted_sketches": [list(row) for row in sketches[:8]],
             }
         return {}
@@ -3500,7 +3754,9 @@ class QwenExoRuntime:
             item = (
                 raw_item
                 if isinstance(raw_item, dict)
-                else raw_item.model_dump() if hasattr(raw_item, "model_dump") else None
+                else raw_item.model_dump()
+                if hasattr(raw_item, "model_dump")
+                else None
             )
             if isinstance(item, dict):
                 items.append(item)

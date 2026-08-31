@@ -20,6 +20,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.test.test_utils import CustomTestCase
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -1549,6 +1550,117 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
         )
         self.assertEqual(runtime.discarded[0][1]["observed_tokens"], 4)
         self.assertIsNone(runtime.boundaries[0][1]["injection"])
+
+
+class ContinuationCacheRegressionTestCase(CustomTestCase):
+    def test_phase_two_preserves_score_bias_logprob_window(self):
+        serving = make_serving()
+        serving.tokenizer_manager.model_config.context_len = 512
+        tokenizer = serving.tokenizer_manager.tokenizer
+
+        def encode(text, add_special_tokens=False):
+            del add_special_tokens
+            return [] if not text else list(range(len(str(text).split())))
+
+        tokenizer.encode.side_effect = encode
+        tokenizer.decode.side_effect = lambda token_ids, skip_special_tokens=False: (
+            "</think>" if list(token_ids) == [99] else ""
+        )
+
+        calls = []
+
+        def generate(request, _raw_request):
+            calls.append(request)
+            request_index = len(calls)
+
+            async def results():
+                if request_index == 1:
+                    yield {
+                        "text": "<think>draft",
+                        "output_ids": [10, 11],
+                        "meta_info": {
+                            "prompt_tokens": 100,
+                            "cached_tokens": 96,
+                            "completion_tokens": 2,
+                            "finish_reason": {"type": "stop", "matched": 99},
+                        },
+                    }
+                else:
+                    yield {
+                        "text": "final",
+                        "output_ids": [20],
+                        "meta_info": {
+                            "prompt_tokens": len(request.input_ids),
+                            "completion_tokens": 1,
+                            "finish_reason": {"type": "stop", "matched": 0},
+                        },
+                    }
+
+            return results()
+
+        serving.tokenizer_manager.generate_request.side_effect = generate
+
+        class FakeRuntime:
+            reasoning_end_token_id = 99
+            think_context_enabled = True
+            score_bias_enabled = True
+
+            @staticmethod
+            def score_bias_payload(_request_id, _prompt_ids):
+                return ()
+
+            @staticmethod
+            def score_bias_capture_payload(_request_id, _prompt_ids):
+                return ({"start": 70, "end": 80},)
+
+            @staticmethod
+            def register_generation_prompt(*_args, **_kwargs):
+                pass
+
+            @staticmethod
+            def observe_generation_result(*_args, **_kwargs):
+                pass
+
+            @staticmethod
+            async def await_think_context(_request_id):
+                return None
+
+            @staticmethod
+            def record_reasoning_boundary(*_args, **_kwargs):
+                pass
+
+        runtime = FakeRuntime()
+        raw_request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(qwen_exo_runtime=runtime))
+        )
+        adapted_request = GenerateReqInput(
+            input_ids=list(range(100)),
+            sampling_params={"max_new_tokens": 32},
+            return_logprob=True,
+            logprob_start_len=0,
+            stream=False,
+            rid="resp-continuation-cache",
+        )
+
+        async def collect():
+            snapshots = []
+            async for current in serving._generate_with_builtin_tools(
+                "resp-continuation-cache",
+                adapted_request.input_ids,
+                adapted_request,
+                {"max_new_tokens": 32},
+                SimpleContext(),
+                raw_request=raw_request,
+            ):
+                snapshots.append(current)
+            return snapshots
+
+        asyncio.run(collect())
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].logprob_start_len, 69)
+        self.assertEqual(calls[1].logprob_start_len, 69)
+        self.assertEqual(calls[1].input_ids[:100], list(range(100)))
 
 
 if __name__ == "__main__":

@@ -29,6 +29,9 @@ def server_args(tmp_path, **overrides):
         "qwen_exo_enable_capsule": True,
         "qwen_exo_enable_adaptive_refresh": False,
         "qwen_exo_context_evidence_mode": "off",
+        "qwen_exo_experimental_context_integrity": False,
+        "qwen_exo_context_integrity_mode": "active",
+        "qwen_exo_context_integrity_context_divisor": 3,
         "model_path": "model",
         "tp_size": 2,
         "dtype": "bfloat16",
@@ -73,6 +76,27 @@ def test_experimental_activation_training_defaults_off_and_is_public(tmp_path):
     )
     assert enabled.feature_flags.activation_training is True
     assert enabled.public_dict()["features"]["activation_training"] is True
+
+
+def test_experimental_context_integrity_defaults_off_and_can_be_enabled(tmp_path):
+    disabled = QwenExoConfig.from_server_args(
+        server_args(tmp_path, qwen_exo_context_integrity_mode="active")
+    )
+    assert disabled.context_integrity_mode == "off"
+    assert disabled.feature_flags.context_integrity is False
+
+    enabled = QwenExoConfig.from_server_args(
+        server_args(
+            tmp_path,
+            qwen_exo_observer_mode="active",
+            qwen_exo_enable_adaptive_refresh=True,
+            qwen_exo_context_integrity_mode="active",
+            qwen_exo_experimental_context_integrity=True,
+        )
+    )
+    assert enabled.context_integrity_mode == "active"
+    assert enabled.feature_flags.context_integrity is True
+    assert enabled.public_dict()["features"]["context_integrity"] is True
 
 
 def test_response_output_budget_is_public_and_positive(tmp_path):
@@ -361,6 +385,7 @@ def test_context_features_require_adaptive_refresh_and_reject_shadow(tmp_path):
             qwen_exo_enable_adaptive_refresh=True,
             qwen_exo_context_evidence_mode="active",
             qwen_exo_context_integrity_mode="active",
+            qwen_exo_experimental_context_integrity=True,
             context_length=204000,
             qwen_exo_context_integrity_context_divisor=3,
         )
@@ -385,6 +410,7 @@ def test_context_features_require_adaptive_refresh_and_reject_shadow(tmp_path):
                 qwen_exo_observer_mode="active",
                 qwen_exo_enable_adaptive_refresh=True,
                 qwen_exo_context_integrity_mode="shadow",
+                qwen_exo_experimental_context_integrity=True,
             )
         )
 

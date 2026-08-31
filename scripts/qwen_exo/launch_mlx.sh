@@ -8,6 +8,7 @@ set -euo pipefail
 : "${QWEN_EXO_DTYPE:=float16}"
 : "${QWEN_EXO_QUANTIZATION:=mlx_q4}"
 : "${QWEN_EXO_KV_CACHE_DTYPE:=mxfp8}"
+: "${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY:=0}"
 : "${QWEN_EXO_STATE_DIRECTORY_NAME:=state-mlx-tp1-${QWEN_EXO_QUANTIZATION}-${QWEN_EXO_KV_CACHE_DTYPE}}"
 : "${QWEN_EXO_MEM_FRACTION_STATIC:=0.80}"
 : "${QWEN_EXO_MAX_RUNNING_REQUESTS:=64}"
@@ -26,6 +27,8 @@ set -euo pipefail
 : "${QWEN_EXO_OBSERVER_MODE:=active}"
 : "${QWEN_EXO_ENABLE_ADAPTIVE_REFRESH:=1}"
 : "${QWEN_EXO_CONTEXT_EVIDENCE_MODE:=active}"
+# Context Integrity is CLI-only; the active mode is latent until the
+# experimental startup flag is explicitly supplied.
 : "${QWEN_EXO_CONTEXT_INTEGRITY_MODE:=active}"
 : "${QWEN_EXO_CONTEXT_INTEGRITY_CONTEXT_DIVISOR:=3}"
 : "${QWEN_EXO_REFLECTION_MEMORY_MODE:=active}"
@@ -179,6 +182,9 @@ server_args=(
 )
 if [[ "${QWEN_EXO_QUANTIZATION}" != "none" ]]; then
   server_args+=( --quantization "${QWEN_EXO_QUANTIZATION}" )
+fi
+if [[ "${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY}" == "1" ]]; then
+  server_args+=( --qwen-exo-experimental-context-integrity )
 fi
 if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
   server_args+=(

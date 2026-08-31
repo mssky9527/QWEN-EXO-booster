@@ -61,6 +61,12 @@ Download address for the 27B inference-acceleration model:
 
 https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2
 
+### Context Integrity (experimental)
+
+Context Integrity is disabled in normal launches. It is allowed only when
+`QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY=1` is set at startup (or when
+`--qwen-exo-experimental-context-integrity` is passed).
+
 ## Accessing the console
 
 The console listens only on `127.0.0.1` by default. Do not expose it directly to the public Internet.

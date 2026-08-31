@@ -3074,12 +3074,23 @@ class ServerArgs:
             choices=["off", "active"],
         ),
     ] = "active"
+    qwen_exo_experimental_context_integrity: A[
+        bool,
+        Arg(
+            help=(
+                "Enable experimental QWEN-EXO Context Integrity checks. "
+                "Disabled by default."
+            ),
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = False
     qwen_exo_context_integrity_mode: A[
         str,
         Arg(
             help=(
-                "Let the model review the latest tool content against recent "
-                "private session context without tool-name heuristics."
+                "Let the model review recent tool context. This experimental "
+                "mode is effective only with "
+                "--qwen-exo-experimental-context-integrity."
             ),
             choices=["off", "active"],
         ),
@@ -3202,11 +3213,11 @@ class ServerArgs:
     ] = 0.005
     qwen_exo_score_bias_anchor_bias: A[
         float,
-        "Small positive bias reserved for original system-instruction anchor spans.",
+        "Small positive bias reserved for original system-instruction and tool-schema anchor spans.",
     ] = 0.0
     qwen_exo_score_bias_anchor_max_blocks: A[
         int,
-        "Maximum system-instruction anchor spans carried into decode attention.",
+        "Maximum system-instruction and tool-schema anchor spans carried into decode attention.",
     ] = 2
     qwen_exo_latent_transplant_enabled: A[
         bool,

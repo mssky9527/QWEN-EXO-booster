@@ -368,7 +368,6 @@ def test_decode_slot_observer_and_score_bias_survive_row_reordering():
     torch.testing.assert_close(second["qwen_exo_q_drift"], torch.zeros(2))
 
 
-
 def test_attention_tracker_applies_bounded_system_anchor_without_trajectory_bias():
     tracker = AttentionSignalTracker(
         num_heads=1,
@@ -416,6 +415,7 @@ def test_attention_tracker_applies_bounded_system_anchor_without_trajectory_bias
     torch.testing.assert_close(aux[0, 0, :3], torch.tensor([1.0, 3.0, 0.01]))
     assert info["qwen_exo_score_bias_anchor_count"].tolist() == [1.0]
     assert info["qwen_exo_score_bias_selected_count"].tolist() == [0.0]
+
 
 def test_runtime_builds_original_and_latest_user_query_spans():
     from collections import OrderedDict
@@ -507,14 +507,193 @@ def test_runtime_builds_system_instruction_anchor_spans():
         input=[{"role": "user", "content": "first task"}],
     )
 
+    payload = runtime.score_bias_user_query_payload(request, [30, 31, 32, 99, 10, 11])
+
+    assert payload["anchor_spans"] == [{"start": 0, "end": 3, "source": "system"}]
+    assert runtime.telemetry.events[-1][1] == "score_bias.user_query_prepared"
+
+
+def test_runtime_builds_tool_schema_anchor_spans_alongside_system():
+    import json
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    from qwen_exo_booster.runtime import QwenExoRuntime
+
+    class Tokenizer:
+        @staticmethod
+        def encode(text, add_special_tokens=False):
+            del add_special_tokens
+            return [ord(char) for char in str(text)]
+
+    class Telemetry:
+        def __init__(self):
+            self.events = []
+
+        def emit(self, *event):
+            self.events.append(event)
+
+    tool = {
+        "type": "function",
+        "name": "hub",
+        "description": "Coordinate repository operations.",
+        "parameters": {
+            "type": "object",
+            "properties": {"op": {"type": "string"}},
+            "required": ["op"],
+        },
+    }
+    function = {
+        "name": tool["name"],
+        "description": tool["description"],
+        "parameters": tool["parameters"],
+    }
+    schema = json.dumps({"type": "function", "function": function}, ensure_ascii=False)
+    system = "SYSTEM_RULES"
+    prompt_text = f"prefix{schema}middle{system}suffix"
+
+    runtime = object.__new__(QwenExoRuntime)
+    runtime.config = SimpleNamespace(
+        feature_flags=SimpleNamespace(score_bias=True),
+        score_bias_mode="trajectory_active",
+        score_bias_anchor_bias=0.01,
+        score_bias_anchor_max_blocks=2,
+    )
+    runtime.tokenizer_manager = SimpleNamespace(tokenizer=Tokenizer())
+    runtime.telemetry = Telemetry()
+    runtime._request_conversation_keys = {"request-tool-anchor": "conversation-tool"}
+    runtime._score_bias_user_queries = OrderedDict()
+    runtime._request_score_bias_user_query_prepared = set()
+    request = SimpleNamespace(
+        request_id="request-tool-anchor",
+        instructions=system,
+        input=[{"role": "user", "content": "call hub"}],
+        tools=[tool],
+        tool_choice="auto",
+    )
+
     payload = runtime.score_bias_user_query_payload(
-        request, [30, 31, 32, 99, 10, 11]
+        request, [ord(char) for char in prompt_text]
     )
 
     assert payload["anchor_spans"] == [
-        {"start": 0, "end": 3, "source": "system"}
+        {
+            "start": len("prefix") + len(schema) + len("middle"),
+            "end": len("prefix") + len(schema) + len("middle") + len(system),
+            "source": "system",
+        },
+        {
+            "start": len("prefix"),
+            "end": len("prefix") + 128,
+            "source": "tool_schema",
+        },
     ]
-    assert runtime.telemetry.events[-1][1] == "score_bias.user_query_prepared"
+    assert runtime.telemetry.events[-1][2]["system_anchor_span_count"] == 1
+    assert runtime.telemetry.events[-1][2]["tool_schema_anchor_span_count"] == 1
+
+
+def test_runtime_tool_schema_anchor_is_opt_in_by_anchor_bias():
+    import json
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    from qwen_exo_booster.runtime import QwenExoRuntime
+
+    class Tokenizer:
+        @staticmethod
+        def encode(text, add_special_tokens=False):
+            del add_special_tokens
+            return [ord(char) for char in str(text)]
+
+    tool = {
+        "type": "function",
+        "name": "noop",
+        "description": "Do nothing.",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    schema = json.dumps(
+        {
+            "type": "function",
+            "function": {
+                "name": "noop",
+                "description": "Do nothing.",
+                "parameters": tool["parameters"],
+            },
+        },
+        ensure_ascii=False,
+    )
+    request = SimpleNamespace(
+        request_id="request-tool-opt-in",
+        input=[{"role": "user", "content": "call noop"}],
+        tools=[tool],
+        tool_choice="auto",
+    )
+    runtime = object.__new__(QwenExoRuntime)
+    runtime.config = SimpleNamespace(
+        feature_flags=SimpleNamespace(score_bias=True),
+        score_bias_mode="trajectory_active",
+        score_bias_anchor_bias=0.0,
+        score_bias_anchor_max_blocks=2,
+    )
+    runtime.tokenizer_manager = SimpleNamespace(tokenizer=Tokenizer())
+    runtime.telemetry = SimpleNamespace(emit=lambda *_args: None)
+    runtime._request_conversation_keys = {}
+    runtime._score_bias_user_queries = OrderedDict()
+    runtime._request_score_bias_user_query_prepared = set()
+
+    payload = runtime.score_bias_user_query_payload(
+        request, [ord(char) for char in f"<tools>{schema}</tools>"]
+    )
+
+    assert "anchor_spans" not in payload
+
+
+def test_runtime_tool_schema_anchor_falls_back_to_tools_marker():
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    from qwen_exo_booster.runtime import QwenExoRuntime
+
+    class Tokenizer:
+        @staticmethod
+        def encode(text, add_special_tokens=False):
+            del add_special_tokens
+            return [ord(char) for char in str(text)]
+
+    request = SimpleNamespace(
+        request_id="request-tool-marker",
+        input=[{"role": "user", "content": "call a tool"}],
+        tools=[
+            {
+                "type": "function",
+                "name": "noop",
+                "description": "Do nothing.",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        tool_choice="auto",
+    )
+    runtime = object.__new__(QwenExoRuntime)
+    runtime.config = SimpleNamespace(
+        feature_flags=SimpleNamespace(score_bias=True),
+        score_bias_mode="trajectory_active",
+        score_bias_anchor_bias=0.01,
+        score_bias_anchor_max_blocks=2,
+    )
+    runtime.tokenizer_manager = SimpleNamespace(tokenizer=Tokenizer())
+    runtime.telemetry = SimpleNamespace(emit=lambda *_args: None)
+    runtime._request_conversation_keys = {}
+    runtime._score_bias_user_queries = OrderedDict()
+    runtime._request_score_bias_user_query_prepared = set()
+
+    prompt = "<tools>opaque</tools>"
+    payload = runtime.score_bias_user_query_payload(
+        request, [ord(char) for char in prompt]
+    )
+
+    assert payload["anchor_spans"] == [
+        {"start": 0, "end": len(prompt), "source": "tool_schema"}
+    ]
 
 
 def test_attention_tracker_preserves_persisted_user_q_when_latest_q_is_captured():
