@@ -19,11 +19,11 @@ from qwen_exo_booster.service_config import (
 def test_tensor_bank_defaults_reserve_context_and_full_attention_capacity():
     values = default_values()
 
-    assert values["context_length"] == 102400
+    assert values["context_length"] == 131072
     assert values["qwen_exo_tensor_bank_max_document_tokens"] == 100352
     assert values["qwen_exo_tensor_bank_salient_token_budget"] == 4096
 
-    values["qwen_exo_tensor_bank_max_document_tokens"] = 100416
+    values["qwen_exo_tensor_bank_max_document_tokens"] = 129088
     with pytest.raises(ServiceConfigError, match="上下文长度减 2048"):
         validate_values(values)
 

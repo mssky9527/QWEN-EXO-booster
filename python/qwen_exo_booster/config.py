@@ -85,7 +85,7 @@ class QwenExoConfig:
     quantization: str = "none"
     kv_cache_dtype: str = "auto"
     max_running_requests: int = 10
-    context_length: int = 102400
+    context_length: int = 131072
     policy_data_directory: Path | None = None
     cognition_directory: Path | None = None
     max_policy_tokens: int = 4096
@@ -532,7 +532,7 @@ class QwenExoConfig:
             max_running_requests=int(
                 getattr(server_args, "max_running_requests", 10) or 10
             ),
-            context_length=int(getattr(server_args, "context_length", 102400)),
+            context_length=int(getattr(server_args, "context_length", 131072)),
             model_path=str(server_args.model_path),
             tp_size=int(server_args.tp_size),
             backend=backend,

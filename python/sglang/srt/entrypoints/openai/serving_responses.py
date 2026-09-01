@@ -96,6 +96,7 @@ _QWEN_EXO_SELF_CHECK_START = "<qwen_exo_self_check>"
 _QWEN_EXO_SELF_CHECK_END = "</qwen_exo_self_check>"
 
 _QWEN_EXO_DFLASH_THINK_PHASE = "qwen_exo_dflash_think_phase"
+_CONTEXT_LENGTH_ERROR_CODE = "context_length_exceeded"
 
 
 class _QwenExoSelfAskSpillRouter:
@@ -304,12 +305,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         err_type: str = "invalid_request_error",
         status_code: int = 400,
         param: Optional[str] = None,
+        code: str | int | None = None,
     ) -> ORJSONResponse:
         nested_error = {
             "message": message,
             "type": err_type,
             "param": param,
-            "code": status_code,
+            "code": status_code if code is None else code,
         }
         return ORJSONResponse(content={"error": nested_error}, status_code=status_code)
 
@@ -871,6 +873,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                     # Account for reserved tokens (e.g., EAGLE speculative decoding slots)
                     # that the tokenizer_manager adds during validation
                     num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
+                    input_token_count = prompt_length + num_reserved_tokens
+                    if input_token_count >= context_len:
+                        message = (
+                            f"The input ({input_token_count} tokens) is longer than "
+                            f"the model's context length ({context_len} tokens)."
+                        )
+                        return self.create_error_response(
+                            message,
+                            err_type="invalid_request_error",
+                            status_code=HTTPStatus.BAD_REQUEST,
+                            param="input",
+                            code=_CONTEXT_LENGTH_ERROR_CODE,
+                        )
                     default_max_tokens = max(
                         context_len - prompt_length - num_reserved_tokens, 512
                     )  # Ensure minimum 512 tokens
@@ -1098,7 +1113,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
                     generators.append(generator)
             except ValueError as e:
-                return self.create_error_response(str(e))
+                return self._error_response_for_exception(e)
 
             assert len(generators) == 1
             (result_generator,) = generators
@@ -1215,7 +1230,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     response.headers[key] = value
                 return response
             except Exception as e:
-                return self.create_error_response(str(e))
+                return self._error_response_for_exception(e)
         return self.create_error_response("Unknown error")
 
     async def _make_request(
@@ -1288,7 +1303,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:
-            return self.create_error_response(str(e))
+            return self._error_response_for_exception(e)
 
         finish_reason: Mapping[str, Any] | None = None
         if self.use_harmony:
@@ -2029,6 +2044,26 @@ class OpenAIServingResponses(OpenAIServingChat):
         }
 
     @staticmethod
+    def _is_context_length_error(exc: Exception) -> bool:
+        message = str(exc).casefold()
+        return "context length" in message and (
+            "input" in message
+            or "token count" in message
+            or "maximum context" in message
+        )
+
+    def _error_response_for_exception(self, exc: Exception) -> ORJSONResponse:
+        if self._is_context_length_error(exc):
+            return self.create_error_response(
+                str(exc),
+                err_type="invalid_request_error",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="input",
+                code=_CONTEXT_LENGTH_ERROR_CODE,
+            )
+        return self.create_error_response(str(exc))
+
+    @staticmethod
     def _public_response_error(
         exc: Exception,
     ) -> tuple[dict[str, str], dict[str, str]]:
@@ -2038,25 +2073,28 @@ class OpenAIServingResponses(OpenAIServingChat):
             message = str(detail.get("message", exc.detail))
             internal_code = str(detail.get("code", "scheduler_abort"))
             retry_after = detail.get("retry_after")
+        elif OpenAIServingResponses._is_context_length_error(exc):
+            status_code = int(HTTPStatus.BAD_REQUEST)
+            message = str(exc)
+            internal_code = _CONTEXT_LENGTH_ERROR_CODE
+            retry_after = None
         else:
-            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+            status_code = int(HTTPStatus.INTERNAL_SERVER_ERROR)
             message = "Request failed"
             internal_code = type(exc).__name__
             retry_after = None
-        public_code = (
-            "rate_limit_exceeded"
-            if status_code == HTTPStatus.TOO_MANY_REQUESTS
-            else (
-                "invalid_prompt"
-                if status_code
-                in {
-                    HTTPStatus.BAD_REQUEST,
-                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                    HTTPStatus.UNPROCESSABLE_ENTITY,
-                }
-                else "server_error"
-            )
-        )
+        if internal_code == _CONTEXT_LENGTH_ERROR_CODE:
+            public_code = _CONTEXT_LENGTH_ERROR_CODE
+        elif status_code == HTTPStatus.TOO_MANY_REQUESTS:
+            public_code = "rate_limit_exceeded"
+        elif status_code in {
+            HTTPStatus.BAD_REQUEST,
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            HTTPStatus.UNPROCESSABLE_ENTITY,
+        }:
+            public_code = "invalid_prompt"
+        else:
+            public_code = "server_error"
         diagnostics = {
             "qwen_exo_error_code": internal_code,
             "qwen_exo_error_status": str(status_code),

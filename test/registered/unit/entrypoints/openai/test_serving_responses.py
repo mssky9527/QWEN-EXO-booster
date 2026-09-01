@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -962,6 +963,27 @@ class HarmonyResponsesTestCase(unittest.TestCase):
         self.assertEqual(
             sdk_response.metadata["qwen_exo_error_code"],
             "qwen_exo_capacity_exhausted",
+        )
+
+    def test_context_length_error_maps_to_explicit_400_code(self):
+        message = "The input (103766 tokens) is longer than the model's context length (102400 tokens)."
+        exc = ValueError(message)
+
+        error, diagnostics = OpenAIServingResponses._public_response_error(exc)
+        self.assertEqual(
+            error,
+            {"message": message, "code": "context_length_exceeded"},
+        )
+        self.assertEqual(diagnostics["qwen_exo_error_code"], "context_length_exceeded")
+        self.assertEqual(diagnostics["qwen_exo_error_status"], "400")
+
+        response = make_serving()._error_response_for_exception(exc)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.body)["error"]["code"], "context_length_exceeded"
+        )
+        self.assertEqual(
+            json.loads(response.body)["error"]["param"], "input"
         )
 
     def test_nested_response_metadata_is_json_encoded_as_strings(self):

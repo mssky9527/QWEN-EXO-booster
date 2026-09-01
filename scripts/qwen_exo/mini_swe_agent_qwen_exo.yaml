@@ -1,6 +1,6 @@
 agent:
   agent_class: qwen_exo_compacting_agent.CompactingInteractiveAgent
-  context_window_tokens: 102400
+  context_window_tokens: 131072
   compaction_threshold: 0.70
   compaction_keep_model_turns: 6
   compaction_summary_chars: 16000

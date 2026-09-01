@@ -18,7 +18,7 @@ class CompactingAgentConfig(InteractiveAgentConfig):
         not in {"0", "false", "no"}
     )
     context_window_tokens: int = Field(
-        default_factory=lambda: int(os.getenv("MSWEA_CONTEXT_WINDOW_TOKENS", "102400")),
+        default_factory=lambda: int(os.getenv("MSWEA_CONTEXT_WINDOW_TOKENS", "131072")),
         gt=0,
     )
     compaction_threshold: float = Field(default=0.70, gt=0.0, lt=1.0)

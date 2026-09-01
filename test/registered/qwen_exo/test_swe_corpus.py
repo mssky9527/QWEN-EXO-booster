@@ -39,7 +39,7 @@ def test_swe_agent_does_not_override_action_policy():
         "tool_choice",
     }.intersection(config["model"])
     assert "environment" not in config
-    assert config["agent"]["context_window_tokens"] == 102400
+    assert config["agent"]["context_window_tokens"] == 131072
     assert "max_tokens" not in config["model"]["model_kwargs"]
     sampling = config["model"]["model_kwargs"]
     assert sampling["max_output_tokens"] == 8192

@@ -8,7 +8,7 @@ export type PlainSettingCopy = {
 export const SETTING_COPY: Record<string, readonly [string, string]> = {
   context_length: [
     "上下文长度",
-    "定义单次请求可进入模型的最大 token 容量；调大可承载更长历史，调小可降低显存压力，当前双卡推荐 102400。",
+    "定义单次请求可进入模型的最大 token 容量；调大可承载更长历史，调小可降低显存压力，当前双卡默认 131072（128K）。",
   ],
   default_enable_thinking: [
     "默认启用思考",

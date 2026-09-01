@@ -5,7 +5,7 @@ set -euo pipefail
 : "${QWEN_EXO_ENABLED:=1}"
 : "${QWEN_EXO_CONTAINER:=qwen-exo-booster}"
 : "${QWEN_EXO_SOURCE_PATH:=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
-: "${QWEN_EXO_CONTEXT_LENGTH:=102400}"
+: "${QWEN_EXO_CONTEXT_LENGTH:=131072}"
 : "${QWEN_EXO_TP_SIZE:=2}"
 : "${QWEN_EXO_DOCKER_GPUS:=all}"
 : "${QWEN_EXO_DTYPE:=bfloat16}"
