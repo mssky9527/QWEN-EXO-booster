@@ -255,7 +255,9 @@ class SchedulerPPMixin:
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
-                prefill_plan = self.get_new_batch_prefill(self.running_batch)
+                prefill_plan = self.get_new_batch_prefill(
+                    self.running_batch, last_batch=self.last_batch
+                )
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)

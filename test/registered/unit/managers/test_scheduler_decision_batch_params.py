@@ -86,6 +86,27 @@ class TestDFlashActiveBatchIsolation(unittest.TestCase):
             (False, True),
         )
 
+    @staticmethod
+    def _batch(reqs, *, target_only):
+        return SimpleNamespace(
+            reqs=reqs,
+            spec_algorithm=SimpleNamespace(is_none=lambda: target_only),
+        )
+
+    def test_batch_mode_blocks_opposite_lane_when_request_metadata_is_stale(self):
+        running_batch = self._batch(
+            [self._request("internal", dflash_mode="eligible")],
+            target_only=True,
+        )
+        last_batch = self._batch(
+            [self._request("user")],
+            target_only=False,
+        )
+
+        self.assertEqual(
+            Scheduler._dflash_active_request_flags(running_batch, last_batch),
+            (True, True),
+        )
 
 
 if __name__ == "__main__":

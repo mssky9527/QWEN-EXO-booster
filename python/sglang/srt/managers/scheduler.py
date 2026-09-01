@@ -3643,15 +3643,43 @@ class Scheduler(
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch] = None,
     ) -> Tuple[bool, bool]:
-        """Return target-only and non-target request presence across in-flight batches."""
+        """Return target-only/non-target presence across in-flight batches.
+
+        Request metadata is the admission source of truth, but a batch's
+        ``spec_algorithm`` is authoritative once that batch has been created.
+        Keep both signals so a request whose grammar/hidden-state metadata
+        changes while it is in flight cannot open an incompatible lane.
+        """
         active_requests = [req for req in running_batch.reqs if not req.finished()]
         if last_batch is not None and last_batch is not running_batch:
             active_requests.extend(req for req in last_batch.reqs if not req.finished())
-        return (
-            bool(active_requests)
-            and all(is_dflash_target_only_request(req) for req in active_requests),
-            any(not is_dflash_target_only_request(req) for req in active_requests),
+        has_target_only = bool(active_requests) and all(
+            is_dflash_target_only_request(req) for req in active_requests
         )
+        has_non_target_only = any(
+            not is_dflash_target_only_request(req) for req in active_requests
+        )
+
+        # The batch mode remains meaningful for one overlap iteration even if
+        # result processing has already marked a request finished.  This is
+        # exactly the interval in which the batch metadata can still be read
+        # by the overlap scheduler.
+        batches = [running_batch]
+        if last_batch is not None and last_batch is not running_batch:
+            batches.append(last_batch)
+        for batch in batches:
+            if not getattr(batch, "reqs", None):
+                continue
+            spec_algorithm = getattr(batch, "spec_algorithm", None)
+            is_none = getattr(spec_algorithm, "is_none", None)
+            if not callable(is_none):
+                continue
+            if is_none():
+                has_target_only = True
+            else:
+                has_non_target_only = True
+
+        return has_target_only, has_non_target_only
 
     def get_new_batch_prefill(
         self,
