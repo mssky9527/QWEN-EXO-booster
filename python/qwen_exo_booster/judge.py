@@ -136,6 +136,64 @@ class JudgeBatchResult:
     question_original_tokens: int = 0
     question_review_tokens: int = 0
 
+    @classmethod
+    def combine(
+        cls,
+        candidates: Iterable[KnowledgeCandidate],
+        batches: Iterable[Any],
+        decisions: Iterable[EligibilityDecision],
+        *,
+        selected_candidate_id: str | None,
+        selection_method: str,
+    ) -> JudgeBatchResult | None:
+        """Aggregate sequential bounded waves into one admission result."""
+        candidate_tuple = tuple(candidates)
+        batch_tuple = tuple(batches)
+        decision_tuple = tuple(decisions)
+        if not batch_tuple:
+            return None
+        last = batch_tuple[-1]
+        return cls(
+            decisions=decision_tuple,
+            candidate_count=len(candidate_tuple),
+            valid_count=sum(
+                decision.status is not EligibilityStatus.INVALID
+                for decision in decision_tuple
+            ),
+            eligible_count=sum(decision.eligible for decision in decision_tuple),
+            shared_prefix_key=str(getattr(last, "shared_prefix_key", "")),
+            latency_seconds=sum(
+                float(getattr(batch, "latency_seconds", 0.0)) for batch in batch_tuple
+            ),
+            prompt_tokens=sum(
+                int(getattr(batch, "prompt_tokens", 0)) for batch in batch_tuple
+            ),
+            completion_tokens=sum(
+                int(getattr(batch, "completion_tokens", 0)) for batch in batch_tuple
+            ),
+            cache_hit_count=sum(
+                int(getattr(batch, "cache_hit_count", 0)) for batch in batch_tuple
+            ),
+            executed_count=sum(
+                int(getattr(batch, "executed_count", 0)) for batch in batch_tuple
+            ),
+            selection_method=selection_method,
+            selected_candidate_id=selected_candidate_id,
+            presented_candidate_count=len(candidate_tuple),
+            question_truncated=any(
+                bool(getattr(batch, "question_truncated", False))
+                for batch in batch_tuple
+            ),
+            question_original_tokens=max(
+                int(getattr(batch, "question_original_tokens", 0))
+                for batch in batch_tuple
+            ),
+            question_review_tokens=max(
+                int(getattr(batch, "question_review_tokens", 0))
+                for batch in batch_tuple
+            ),
+        )
+
 
 class ReferenceJudge:
     def __init__(

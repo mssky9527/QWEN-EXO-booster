@@ -995,7 +995,7 @@ def test_reflection_collection_label_does_not_merge_distinct_memories(tmp_path):
     assert state.selected_document_ids == (first.document_id,)
 
 
-def test_request_start_filters_reflection_from_another_task(tmp_path):
+def test_request_start_reviews_but_blocks_reflection_from_another_task(tmp_path):
     repo = KnowledgeRepository(tmp_path / "reflection-scope")
     target_task = "Please solve this issue: add implicit HEAD and OPTIONS routing"
     other_task = "Please solve this issue: add deprecated response headers"
@@ -1035,15 +1035,25 @@ def test_request_start_filters_reflection_from_another_task(tmp_path):
     )
 
     assert [candidate.relative_path for candidate in judge.calls[0][2]] == [
+        "reflection-memory/other.md",
+        "reflection-memory/target.md",
+    ]
+    assert [candidate.relative_path for candidate in judge.calls[1][2]] == [
         "reflection-memory/target.md"
     ]
-    assert judge.calls[0][2][0].candidate_origin == "task_scope_exact"
-    assert state.decisions[0].status is EligibilityStatus.ELIGIBLE
+    assert state.decisions[0].status is EligibilityStatus.INELIGIBLE
+    assert state.decisions[0].judge_method.endswith(":task_scope")
+    assert state.decisions[1].status is EligibilityStatus.ELIGIBLE
     assert state.selected_document_ids == ()
     (proposed,) = telemetry.by_type("tensor.candidates_proposed")
     assert proposed["task_scope_filtered_count"] == 1
+    assert proposed["task_scope_filtered_candidate_ids"] == [other.candidate_id]
     assert proposed["task_scope_exact_candidate_count"] == 1
     assert proposed["task_scope_category"] == reflection_task_category(target_task)
+    (completed,) = telemetry.by_type("semantic_judge.completed")
+    assert completed["candidate_count"] == 2
+    assert completed["task_scope_blocked_count"] == 1
+    assert completed["judge_wave_count"] == 2
 
 
 def test_comparative_selector_can_choose_lower_qk_candidate(tmp_path):
@@ -1083,7 +1093,7 @@ def test_comparative_selector_can_choose_lower_qk_candidate(tmp_path):
     assert judge_event["question_review_tokens"] == 2048
 
 
-def test_comparative_selector_score_filters_to_top_eight_candidates(tmp_path):
+def test_comparative_selector_preserves_all_qk_candidates(tmp_path):
     repo = repository(tmp_path)
     for index in range(3):
         repo.upsert(f"extra-{index}.md", f"Distinct reference number {index}")
@@ -1110,7 +1120,7 @@ def test_comparative_selector_score_filters_to_top_eight_candidates(tmp_path):
 
     _prepared, state = prepare(
         pipeline,
-        FakeRequest(request_id="resp-top-eight", input="Choose the best reference"),
+        FakeRequest(request_id="resp-all-qk", input="Choose the best reference"),
     )
 
     judged = judge.selection_calls[0][2]
@@ -1118,8 +1128,120 @@ def test_comparative_selector_score_filters_to_top_eight_candidates(tmp_path):
     assert len(state.decisions) == 5
     (prefilter,) = telemetry.by_type("qk.prefilter")
     assert prefilter["candidate_count"] == 5
+    assert prefilter["qk_candidate_count"] == 5
+    assert prefilter["qk_sent_to_judge"] == 5
     assert prefilter["sent_to_judge"] == 5
     assert prefilter["score_filtered_count"] == 0
+
+
+def test_large_qk_shortlist_is_judged_in_bounded_waves(tmp_path):
+    repo = repository(tmp_path)
+    extra_paths = tuple(f"extra-{index}.md" for index in range(10))
+    for index, path in enumerate(extra_paths):
+        repo.upsert(path, f"Distinct reference number {index}")
+    paths = ("wfp.md", "ctf.md", *extra_paths)
+    candidates = tuple(
+        native_candidate(
+            repo,
+            path,
+            page_id=index + 1,
+            score=0.99 - index * 0.01,
+        )
+        for index, path in enumerate(paths)
+    )
+    judge = FakeReferenceJudge()
+    telemetry = FakeTelemetry()
+    pipeline = build_pipeline(
+        replace(
+            config(tmp_path, policy_data=False),
+            max_candidates=len(candidates),
+            max_internal_fanout=3,
+            qk_prefilter_mode="off",
+        ),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=FakeQKTensorBank(candidates),
+        reference_judge=judge,
+        telemetry=telemetry,
+    )
+
+    _prepared, state = prepare(
+        pipeline,
+        FakeRequest(request_id="resp-qk-waves", input="Choose a reference"),
+    )
+
+    assert [len(call[2]) for call in judge.calls] == [3, 3, 3, 3]
+    assert sum(len(call[2]) for call in judge.calls) == len(candidates)
+    assert len(state.decisions) == len(candidates)
+    (completed,) = telemetry.by_type("semantic_judge.completed")
+    assert completed["candidate_count"] == len(candidates)
+    assert completed["presented_candidate_count"] == len(candidates)
+    assert completed["judge_wave_count"] == 4
+    assert completed["selection_method"] == "independent_binary_waves"
+
+
+def test_judge_rejection_expands_to_next_qk_wave(tmp_path):
+    repo = repository(tmp_path)
+    extra_paths = tuple(f"extra-{index}.md" for index in range(2))
+    for index, path in enumerate(extra_paths):
+        repo.upsert(path, f"Fallback reference number {index}")
+    paths = ("wfp.md", "ctf.md", *extra_paths)
+    candidates = tuple(
+        native_candidate(
+            repo,
+            path,
+            page_id=index + 1,
+            score=0.95 - index * 0.05,
+        )
+        for index, path in enumerate(paths)
+    )
+    judge = FakeReferenceJudge(
+        supported={
+            "wfp.md": False,
+            "ctf.md": False,
+            "extra-0.md": True,
+            "extra-1.md": False,
+        }
+    )
+    telemetry = FakeTelemetry()
+    pipeline = build_pipeline(
+        replace(
+            config(tmp_path, policy_data=False),
+            max_candidates=2,
+            max_internal_fanout=4,
+            qk_prefilter_mode="off",
+        ),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=FakeQKTensorBank(candidates),
+        reference_judge=judge,
+        telemetry=telemetry,
+    )
+
+    _prepared, state = prepare(
+        pipeline,
+        FakeRequest(request_id="resp-qk-rejection-expansion", input="Find fallback"),
+    )
+
+    assert [call[3] for call in pipeline.tensor_bank.rank_calls] == [2, 4]
+    assert [
+        [candidate.relative_path for candidate in call[2]] for call in judge.calls
+    ] == [["wfp.md", "ctf.md"], ["extra-0.md", "extra-1.md"]]
+    assert state.qk_expanded is True
+    assert state.qk_expansion_reason == "judge_rejected"
+    assert state.qk_shortlist_size == 4
+    assert state.selected_document_ids == (
+        next(
+            document.document_id
+            for document in repo.snapshot.documents
+            if document.relative_path == "extra-0.md"
+        ),
+    )
+    assert len(state.decisions) == 4
+    proposals = telemetry.by_type("tensor.candidates_proposed")
+    assert len(proposals) == 2
+    assert proposals[-1]["new_candidate_count"] == 2
+    assert proposals[-1]["already_judged_count"] == 2
 
 
 def test_second_distinct_page_candidate_kept_when_configured(tmp_path):

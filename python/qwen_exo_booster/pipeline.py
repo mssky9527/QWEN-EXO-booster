@@ -16,6 +16,7 @@ from qwen_exo_booster.contracts import (
     stable_digest,
 )
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
+from qwen_exo_booster.judge import JudgeBatchResult
 from qwen_exo_booster.knowledge import (
     KnowledgeCandidate,
     KnowledgeRepository,
@@ -343,8 +344,14 @@ class MemoryPipeline:
         query_heads: tuple[tuple[tuple[float, ...], ...], ...],
         query_states: tuple[QueryStateSpan, ...],
         query_identity: str,
+        *,
+        limit_override: int | None = None,
     ) -> tuple[tuple[KnowledgeCandidate, ...], dict[str, Any]]:
-        initial_limit = max(1, int(self.config.max_candidates))
+        initial_limit = max(
+            1,
+            int(self.config.max_candidates),
+            int(limit_override or 0),
+        )
         min_tensor_score, rank_margin = self.config.qk_admission_gates
         snapshot = getattr(self.tensor_bank, "snapshot", None)
         source_digest = str(getattr(snapshot, "source_digest", "unknown"))
@@ -482,27 +489,65 @@ class MemoryPipeline:
                 pass
         return (candidate.lane, document_group)
 
+    @staticmethod
+    def _candidate_scope_key(
+        candidate: KnowledgeCandidate,
+    ) -> tuple[str, str, str]:
+        return (
+            candidate.lane,
+            candidate.document_id,
+            candidate.reference_digest,
+        )
+
+    def _task_scope_filtered_keys(
+        self,
+        candidates: tuple[KnowledgeCandidate, ...],
+        original_task: str,
+    ) -> tuple[tuple[str, str, str], ...]:
+        filtered: list[tuple[str, str, str]] = []
+        for candidate in candidates:
+            if candidate.lane != "knowledge":
+                continue
+            try:
+                document = self.repository.get(candidate.document_id)
+            except KeyError:
+                continue
+            if not reflection_memory_matches_task(document, original_task):
+                filtered.append(self._candidate_scope_key(candidate))
+        return tuple(filtered)
+
     def _filter_task_scoped_reflections(
         self,
         candidates: tuple[KnowledgeCandidate, ...],
         original_task: str,
     ) -> tuple[tuple[KnowledgeCandidate, ...], int]:
-        kept = []
-        filtered = 0
-        for candidate in candidates:
-            if candidate.lane != "knowledge":
-                kept.append(candidate)
-                continue
-            try:
-                document = self.repository.get(candidate.document_id)
-            except KeyError:
-                kept.append(candidate)
-                continue
-            if reflection_memory_matches_task(document, original_task):
-                kept.append(candidate)
-            else:
-                filtered += 1
-        return tuple(kept), filtered
+        filtered_keys = self._task_scope_filtered_keys(candidates, original_task)
+        filtered_key_set = frozenset(filtered_keys)
+        kept = tuple(
+            candidate
+            for candidate in candidates
+            if self._candidate_scope_key(candidate) not in filtered_key_set
+        )
+        return kept, len(filtered_keys)
+
+    @staticmethod
+    def _scope_gate_decision(
+        decision: EligibilityDecision,
+        candidate: KnowledgeCandidate,
+        question: str,
+    ) -> EligibilityDecision:
+        if decision.status is not EligibilityStatus.ELIGIBLE:
+            return decision
+        return EligibilityDecision.create(
+            candidate_id=decision.candidate_id,
+            parent_request_id=decision.parent_request_id,
+            question=question,
+            reference=candidate.reference_content,
+            status=EligibilityStatus.INELIGIBLE,
+            judge_method=f"{decision.judge_method}:task_scope",
+            judge_model_fingerprint=decision.judge_model_fingerprint,
+            decision_margin=0.0,
+        )
 
     def _exact_task_reflection_candidates(
         self, original_task: str, query: str
@@ -627,6 +672,9 @@ class MemoryPipeline:
         score_filtered_count: int,
         sent_to_judge: int,
         cache_hit: bool,
+        qk_candidate_count: int = 0,
+        qk_sent_to_judge: int = 0,
+        qk_score_filtered_count: int = 0,
     ) -> None:
         if self.telemetry is None:
             return
@@ -639,6 +687,9 @@ class MemoryPipeline:
             "merged_count": merged_count,
             "sent_to_judge": sent_to_judge,
             "score_filtered_count": score_filtered_count,
+            "qk_candidate_count": qk_candidate_count,
+            "qk_sent_to_judge": qk_sent_to_judge,
+            "qk_score_filtered_count": qk_score_filtered_count,
             "top_score": None,
             "margin": None,
             "min_score": None,
@@ -669,6 +720,7 @@ class MemoryPipeline:
         question: str,
         candidates: tuple[KnowledgeCandidate, ...],
         qk_cache_hit: bool = False,
+        task_scope_blocked_keys: frozenset[tuple[str, str, str]] = frozenset(),
     ) -> tuple[
         tuple[KnowledgeCandidate, ...],
         tuple[EligibilityDecision, ...],
@@ -687,12 +739,41 @@ class MemoryPipeline:
             for candidate in merged_candidates
             if candidate.lane in {"knowledge", "policydata"}
         )
-        judge_limit = min(
-            _COMPARATIVE_CANDIDATE_LIMIT,
-            max(1, int(self.config.max_internal_fanout)),
+        # Q/K candidates are the retrieval contract. They all get a Judge slot;
+        # the configured candidate budget only limits supplemental restored or
+        # lexical candidates. Large Q/K sets are handled in bounded binary waves.
+        qk_judged = tuple(
+            candidate
+            for candidate in all_judged
+            if candidate.candidate_origin == "attention_q_native_tensor_bank"
         )
-        judged = all_judged[:judge_limit]
-        score_filtered_count = len(all_judged) - len(judged)
+        supplemental = tuple(
+            candidate
+            for candidate in all_judged
+            if candidate.candidate_origin != "attention_q_native_tensor_bank"
+        )
+        supplemental_limit = max(
+            0, max(1, int(self.config.max_candidates)) - len(qk_judged)
+        )
+        supplemental_judged = supplemental[:supplemental_limit]
+        judged = tuple(
+            sorted(
+                (*qk_judged, *supplemental_judged),
+                key=lambda candidate: (
+                    -self._raw_tensor_score(candidate),
+                    candidate.lane,
+                    candidate.document_id,
+                ),
+            )
+        )
+        score_filtered_count = len(supplemental) - len(supplemental_judged)
+        qk_score_filtered_count = 0
+        blocked_judged = tuple(
+            candidate
+            for candidate in judged
+            if self._candidate_scope_key(candidate) in task_scope_blocked_keys
+        )
+        blocked_ids = frozenset(candidate.candidate_id for candidate in blocked_judged)
         judge_available = (
             self.reference_judge is not None
             and self.config.feature_flags.reference_judge
@@ -725,22 +806,108 @@ class MemoryPipeline:
                 score_filtered_count=score_filtered_count,
                 sent_to_judge=0 if skip_judge else len(judged),
                 cache_hit=qk_cache_hit,
+                qk_candidate_count=len(qk_judged),
+                qk_sent_to_judge=0 if skip_judge else len(qk_judged),
+                qk_score_filtered_count=qk_score_filtered_count,
             )
-        batch = None
+
+        batches: list[Any] = []
+        selection_method = "not_run"
+        selected_candidate_id: str | None = None
         if judged and judge_available and not skip_judge:
-            judge_kwargs = {
-                "parent_request_id": request_id,
-                "turn_id": f"{request_id}:request-admission-judge",
-                "question": question,
-                "candidates": judged,
-                "telemetry_correlation_id": f"{request_id}:request-admission",
-            }
-            if len(judged) > 1:
-                batch = await self.reference_judge.select_best(**judge_kwargs)
+            token_budget = max(1, int(getattr(self.reference_judge, "token_budget", 1)))
+            token_capacity = max(
+                1, int(self.config.max_internal_tokens) // token_budget
+            )
+            wave_limit = max(
+                1,
+                min(int(self.config.max_internal_fanout), token_capacity),
+            )
+            if len(judged) > _COMPARATIVE_CANDIDATE_LIMIT:
+                for wave_index in range(0, len(judged), wave_limit):
+                    wave = judged[wave_index : wave_index + wave_limit]
+                    batches.append(
+                        await self.reference_judge.judge(
+                            parent_request_id=request_id,
+                            turn_id=(
+                                f"{request_id}:request-admission-judge:wave-"
+                                f"{wave_index // wave_limit}"
+                            ),
+                            question=question,
+                            candidates=wave,
+                            telemetry_correlation_id=(
+                                f"{request_id}:request-admission:wave-"
+                                f"{wave_index // wave_limit}"
+                            ),
+                        )
+                    )
+                selection_method = "independent_binary_waves"
             else:
-                batch = await self.reference_judge.judge(**judge_kwargs)
-        decisions = tuple(batch.decisions) if batch is not None else ()
-        decision_by_id = {decision.candidate_id: decision for decision in decisions}
+                judge_kwargs = {
+                    "parent_request_id": request_id,
+                    "turn_id": f"{request_id}:request-admission-judge",
+                    "question": question,
+                    "candidates": judged,
+                    "telemetry_correlation_id": f"{request_id}:request-admission",
+                }
+                if len(judged) > 1:
+                    first_batch = await self.reference_judge.select_best(**judge_kwargs)
+                else:
+                    first_batch = await self.reference_judge.judge(**judge_kwargs)
+                batches.append(first_batch)
+                selection_method = str(
+                    getattr(first_batch, "selection_method", "independent_binary")
+                )
+                selected_candidate_id = getattr(
+                    first_batch, "selected_candidate_id", None
+                )
+                # A task-scoped reflection may be reviewed, but it must not
+                # win the shared listwise decision. Re-run only the safe set
+                # when the first comparison chose a blocked reflection.
+                if selected_candidate_id in blocked_ids:
+                    safe_judged = tuple(
+                        candidate
+                        for candidate in judged
+                        if candidate.candidate_id not in blocked_ids
+                    )
+                    if safe_judged:
+                        safe_kwargs = {
+                            **judge_kwargs,
+                            "turn_id": f"{request_id}:request-admission-judge:scope-safe",
+                            "candidates": safe_judged,
+                            "telemetry_correlation_id": (
+                                f"{request_id}:request-admission:scope-safe"
+                            ),
+                        }
+                        if len(safe_judged) > 1:
+                            safe_batch = await self.reference_judge.select_best(
+                                **safe_kwargs
+                            )
+                        else:
+                            safe_batch = await self.reference_judge.judge(**safe_kwargs)
+                        batches.append(safe_batch)
+                        selection_method = f"{selection_method}_scope_fallback"
+                        selected_candidate_id = getattr(
+                            safe_batch, "selected_candidate_id", None
+                        )
+
+        decision_by_id: dict[str, EligibilityDecision] = {}
+        for batch in batches:
+            decision_by_id.update(
+                {decision.candidate_id: decision for decision in batch.decisions}
+            )
+        decisions = []
+        for candidate in judged:
+            decision = decision_by_id.get(candidate.candidate_id)
+            if decision is None:
+                continue
+            if candidate.candidate_id in blocked_ids:
+                decision = self._scope_gate_decision(decision, candidate, question)
+            decisions.append(decision)
+        decision_tuple = tuple(decisions)
+        decision_by_id = {
+            decision.candidate_id: decision for decision in decision_tuple
+        }
         question_digest = stable_digest(question)
         eligible_ids = {
             candidate.candidate_id
@@ -754,6 +921,15 @@ class MemoryPipeline:
                 == stable_digest(candidate.reference_content)
             )
         }
+        if selected_candidate_id not in eligible_ids:
+            selected_candidate_id = None
+        batch = JudgeBatchResult.combine(
+            judged,
+            tuple(batches),
+            decision_tuple,
+            selected_candidate_id=selected_candidate_id,
+            selection_method=selection_method,
+        )
         eligible = tuple(
             candidate
             for candidate in merged_candidates
@@ -761,20 +937,26 @@ class MemoryPipeline:
         )
         admission_mode = (
             "comparative_semantic_selection"
-            if batch is not None and batch.selection_method == "comparative_listwise"
+            if batch is not None
+            and batch.selection_method.startswith("comparative_listwise")
             else "semantic_eligibility"
         )
         self._emit_request_judge_telemetry(
             request_id,
             candidates=judged,
             batch=batch,
-            decisions=decisions,
+            decisions=decision_tuple,
             eligible=eligible,
             bypassed_count=len(bypassed),
+            judge_wave_count=len(batches),
+            task_scope_blocked_count=len(blocked_judged),
+            task_scope_blocked_candidate_ids=tuple(
+                candidate.candidate_id for candidate in blocked_judged
+            ),
         )
         return (
             eligible,
-            decisions,
+            decision_tuple,
             float(batch.latency_seconds) if batch is not None else 0.0,
             int(batch.cache_hit_count) if batch is not None else 0,
             int(batch.executed_count) if batch is not None else 0,
@@ -791,6 +973,9 @@ class MemoryPipeline:
         decisions: tuple[EligibilityDecision, ...],
         eligible: tuple[KnowledgeCandidate, ...],
         bypassed_count: int,
+        judge_wave_count: int = 0,
+        task_scope_blocked_count: int = 0,
+        task_scope_blocked_candidate_ids: tuple[str, ...] = (),
     ) -> None:
         if self.telemetry is None:
             return
@@ -800,8 +985,14 @@ class MemoryPipeline:
             {
                 "purpose": "request_start_admission",
                 "candidate_count": len(candidates),
+                "qk_candidate_count": sum(
+                    candidate.candidate_origin == "attention_q_native_tensor_bank"
+                    for candidate in candidates
+                ),
                 "valid_count": int(batch.valid_count) if batch is not None else 0,
-                "eligible_count": sum(decision.eligible for decision in decisions),
+                "eligible_count": (
+                    int(batch.eligible_count) if batch is not None else 0
+                ),
                 "bypassed_count": bypassed_count,
                 "cache_hit_count": (
                     int(batch.cache_hit_count) if batch is not None else 0
@@ -815,6 +1006,11 @@ class MemoryPipeline:
                 ),
                 "presented_candidate_count": (
                     int(batch.presented_candidate_count) if batch is not None else 0
+                ),
+                "judge_wave_count": int(judge_wave_count),
+                "task_scope_blocked_count": int(task_scope_blocked_count),
+                "task_scope_blocked_candidate_ids": list(
+                    task_scope_blocked_candidate_ids
                 ),
                 "question_truncated": (
                     bool(getattr(batch, "question_truncated", False))
@@ -881,6 +1077,7 @@ class MemoryPipeline:
         retrieval_question_digest = stable_digest(question)
         retrieval_started = time.perf_counter()
         candidates: list[KnowledgeCandidate] = []
+        qk_ranked_candidates: tuple[KnowledgeCandidate, ...] = ()
         qk_shortlist_size = 0
         qk_expanded = False
         qk_expansion_reason = "not_requested"
@@ -914,6 +1111,7 @@ class MemoryPipeline:
                 query_states,
                 f"request-query-probe:{retrieval_question_digest}",
             )
+            qk_ranked_candidates = tuple(ranked)
             candidates.extend(ranked)
             qk_shortlist_size = int(qk_meta["shortlist_size"])
             qk_expanded = bool(qk_meta["expanded"])
@@ -1024,9 +1222,16 @@ class MemoryPipeline:
             )
         )
         task_scope_exact_candidate_count = len(exact_task_candidates)
-        candidate_tuple, task_scope_filtered_count = (
-            self._filter_task_scoped_reflections(candidate_tuple, task_scope)
+        task_scope_filtered_keys = self._task_scope_filtered_keys(
+            candidate_tuple, task_scope
         )
+        task_scope_filtered_key_set = frozenset(task_scope_filtered_keys)
+        task_scope_filtered_candidates = tuple(
+            candidate
+            for candidate in candidate_tuple
+            if self._candidate_scope_key(candidate) in task_scope_filtered_key_set
+        )
+        task_scope_filtered_count = len(task_scope_filtered_candidates)
         if self.telemetry is not None:
             self.telemetry.emit(
                 request.request_id,
@@ -1044,6 +1249,11 @@ class MemoryPipeline:
                     "cache_hit": qk_rank_cache_hit,
                     "task_scope_category": reflection_task_category(task_scope),
                     "task_scope_filtered_count": task_scope_filtered_count,
+                    "task_scope_filtered_candidate_ids": [
+                        candidate.candidate_id
+                        for candidate in task_scope_filtered_candidates
+                    ],
+                    "task_scope_blocked_count": task_scope_filtered_count,
                     "task_scope_exact_candidate_count": task_scope_exact_candidate_count,
                 },
             )
@@ -1060,7 +1270,193 @@ class MemoryPipeline:
             question=question,
             candidates=candidate_tuple,
             qk_cache_hit=qk_rank_cache_hit,
+            task_scope_blocked_keys=task_scope_filtered_key_set,
         )
+        # A confident raw Q/K winner can still be semantically wrong. If the
+        # first bounded Judge wave rejects everything, inspect the next ranked
+        # documents once before failing closed.
+        if (
+            not any(
+                candidate.candidate_origin == "attention_q_native_tensor_bank"
+                for candidate in eligible_candidates
+            )
+            and qk_ranked_candidates
+            and query_heads
+            and self.tensor_bank is not None
+            and any(
+                decision.status is not EligibilityStatus.INVALID
+                for decision in admission_decisions
+            )
+        ):
+            current_qk_limit = max(
+                qk_shortlist_size,
+                len(qk_ranked_candidates),
+            )
+            expanded_limit = min(
+                max(current_qk_limit * 2, current_qk_limit + 4),
+                max(current_qk_limit, int(self.config.max_internal_fanout)),
+            )
+            if expanded_limit > current_qk_limit:
+                expanded_ranked, expanded_meta = self._rank_query_candidates(
+                    query_heads,
+                    query_states,
+                    f"request-query-probe:{retrieval_question_digest}",
+                    limit_override=expanded_limit,
+                )
+                existing_qk_keys = {
+                    (
+                        candidate.lane,
+                        candidate.document_id,
+                        candidate.reference_digest,
+                    )
+                    for candidate in qk_ranked_candidates
+                }
+                new_qk_candidates = tuple(
+                    candidate
+                    for candidate in expanded_ranked
+                    if (
+                        candidate.lane,
+                        candidate.document_id,
+                        candidate.reference_digest,
+                    )
+                    not in existing_qk_keys
+                )
+                if new_qk_candidates:
+                    candidate_by_key = {
+                        (
+                            candidate.lane,
+                            candidate.document_id,
+                            candidate.reference_digest,
+                        ): candidate
+                        for candidate in candidate_tuple
+                    }
+                    for candidate in expanded_ranked:
+                        key = (
+                            candidate.lane,
+                            candidate.document_id,
+                            candidate.reference_digest,
+                        )
+                        previous_candidate = candidate_by_key.get(key)
+                        if previous_candidate is None or self._raw_tensor_score(
+                            candidate
+                        ) > self._raw_tensor_score(previous_candidate):
+                            candidate_by_key[key] = candidate
+                    candidate_tuple = tuple(
+                        sorted(
+                            candidate_by_key.values(),
+                            key=lambda candidate: (
+                                -self._raw_tensor_score(candidate),
+                                candidate.lane,
+                                candidate.document_id,
+                            ),
+                        )
+                    )
+                    expanded_scope_keys = frozenset(
+                        self._task_scope_filtered_keys(
+                            new_qk_candidates,
+                            task_scope,
+                        )
+                    )
+                    (
+                        expanded_eligible,
+                        expanded_decisions,
+                        expanded_judge_latency,
+                        expanded_judge_cache_hits,
+                        expanded_judge_executed,
+                        expanded_judge_bypassed,
+                        expanded_admission_mode,
+                    ) = await self._admit_candidates(
+                        request_id=request.request_id,
+                        question=question,
+                        candidates=new_qk_candidates,
+                        qk_cache_hit=bool(expanded_meta["cache_hit"]),
+                        task_scope_blocked_keys=expanded_scope_keys,
+                    )
+                    decision_by_id = {
+                        decision.candidate_id: decision
+                        for decision in admission_decisions
+                    }
+                    decision_by_id.update(
+                        {
+                            decision.candidate_id: decision
+                            for decision in expanded_decisions
+                        }
+                    )
+                    admission_decisions = tuple(
+                        decision_by_id[candidate.candidate_id]
+                        for candidate in candidate_tuple
+                        if candidate.candidate_id in decision_by_id
+                    )
+                    eligible_by_id = {
+                        candidate.candidate_id: candidate
+                        for candidate in eligible_candidates
+                    }
+                    eligible_by_id.update(
+                        {
+                            candidate.candidate_id: candidate
+                            for candidate in expanded_eligible
+                        }
+                    )
+                    eligible_candidates = tuple(eligible_by_id.values())
+                    judge_latency += expanded_judge_latency
+                    judge_cache_hits += expanded_judge_cache_hits
+                    judge_executed += expanded_judge_executed
+                    judge_bypassed_count += expanded_judge_bypassed
+                    knowledge_admission_mode = expanded_admission_mode
+                    qk_ranked_candidates = tuple(expanded_ranked)
+                    qk_shortlist_size = int(expanded_meta["shortlist_size"])
+                    qk_expanded = True
+                    qk_expansion_reason = "judge_rejected"
+                    qk_margin = self._qk_margin(qk_ranked_candidates)
+                    qk_rank_audit = dict(expanded_meta["rank_audit"])
+                    qk_rank_cache_hit = bool(expanded_meta["cache_hit"])
+                    task_scope_filtered_keys = self._task_scope_filtered_keys(
+                        candidate_tuple,
+                        task_scope,
+                    )
+                    task_scope_filtered_key_set = frozenset(task_scope_filtered_keys)
+                    task_scope_filtered_candidates = tuple(
+                        candidate
+                        for candidate in candidate_tuple
+                        if self._candidate_scope_key(candidate)
+                        in task_scope_filtered_key_set
+                    )
+                    task_scope_filtered_count = len(task_scope_filtered_candidates)
+                    if self.telemetry is not None:
+                        self.telemetry.emit(
+                            request.request_id,
+                            "tensor.candidates_proposed",
+                            {
+                                "query_source": ("attention_q_request_start_expansion"),
+                                "candidates": [
+                                    candidate.public_dict()
+                                    for candidate in candidate_tuple
+                                ],
+                                "shortlist_size": qk_shortlist_size,
+                                "expanded": True,
+                                "expansion_reason": qk_expansion_reason,
+                                "new_candidate_count": len(new_qk_candidates),
+                                "already_judged_count": len(qk_ranked_candidates)
+                                - len(new_qk_candidates),
+                                "margin": qk_margin,
+                                "rank_audit": dict(qk_rank_audit),
+                                "cache_hit": qk_rank_cache_hit,
+                                "task_scope_category": reflection_task_category(
+                                    task_scope
+                                ),
+                                "task_scope_blocked_count": (task_scope_filtered_count),
+                                "task_scope_filtered_count": (
+                                    task_scope_filtered_count
+                                ),
+                                "task_scope_filtered_candidate_ids": [
+                                    candidate.candidate_id
+                                    for candidate in task_scope_filtered_candidates
+                                ],
+                                "task_scope_exact_candidate_count": (
+                                    task_scope_exact_candidate_count
+                                ),
+                            },
+                        )
         retrieval_latency = time.perf_counter() - retrieval_started
         restored_answer = None
         restoration_active = False

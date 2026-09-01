@@ -2921,7 +2921,7 @@ class ServerArgs:
     ] = 12288
     qwen_exo_max_candidates: A[
         int,
-        "Maximum candidates recalled independently from each QWEN-EXO source lane.",
+        "Initial candidates per QWEN-EXO source lane; all non-weak native Attention-Q/K candidates are judged, with one bounded rejection-expansion wave.",
     ] = 8
     qwen_exo_max_memory_tokens: A[
         int,

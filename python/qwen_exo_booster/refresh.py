@@ -10,13 +10,14 @@ from typing import Any, Iterable
 
 from qwen_exo_booster.contracts import (
     CancellationToken,
+    EligibilityDecision,
     EligibilityStatus,
     InternalJob,
     InternalJobType,
     stable_digest,
 )
 from qwen_exo_booster.internal_jobs import InternalJobResult, InternalJobRunner
-from qwen_exo_booster.judge import ReferenceJudge
+from qwen_exo_booster.judge import JudgeBatchResult, ReferenceJudge
 from qwen_exo_booster.knowledge import (
     KnowledgeCandidate,
     KnowledgeRepository,
@@ -370,27 +371,65 @@ class SelfAskRefreshService:
         self._self_ask_cache: OrderedDict[str, _SelfQuestion | None] = OrderedDict()
         self._self_ask_cache_lock = asyncio.Lock()
 
+    @staticmethod
+    def _candidate_scope_key(
+        candidate: KnowledgeCandidate,
+    ) -> tuple[str, str, str]:
+        return (
+            candidate.lane,
+            candidate.document_id,
+            candidate.reference_digest,
+        )
+
+    def _task_scope_filtered_keys(
+        self,
+        candidates: tuple[KnowledgeCandidate, ...],
+        original_task: str,
+    ) -> tuple[tuple[str, str, str], ...]:
+        filtered: list[tuple[str, str, str]] = []
+        for candidate in candidates:
+            if candidate.lane != "knowledge":
+                continue
+            try:
+                document = self.repository.get(candidate.document_id)
+            except KeyError:
+                continue
+            if not reflection_memory_matches_task(document, original_task):
+                filtered.append(self._candidate_scope_key(candidate))
+        return tuple(filtered)
+
     def _filter_task_scoped_reflections(
         self,
         candidates: tuple[KnowledgeCandidate, ...],
         original_task: str,
     ) -> tuple[tuple[KnowledgeCandidate, ...], int]:
-        kept = []
-        filtered = 0
-        for candidate in candidates:
-            if candidate.lane != "knowledge":
-                kept.append(candidate)
-                continue
-            try:
-                document = self.repository.get(candidate.document_id)
-            except KeyError:
-                kept.append(candidate)
-                continue
-            if reflection_memory_matches_task(document, original_task):
-                kept.append(candidate)
-            else:
-                filtered += 1
-        return tuple(kept), filtered
+        filtered_keys = self._task_scope_filtered_keys(candidates, original_task)
+        filtered_key_set = frozenset(filtered_keys)
+        kept = tuple(
+            candidate
+            for candidate in candidates
+            if self._candidate_scope_key(candidate) not in filtered_key_set
+        )
+        return kept, len(filtered_keys)
+
+    @staticmethod
+    def _scope_gate_decision(
+        decision: EligibilityDecision,
+        candidate: KnowledgeCandidate,
+        question: str,
+    ) -> EligibilityDecision:
+        if decision.status is not EligibilityStatus.ELIGIBLE:
+            return decision
+        return EligibilityDecision.create(
+            candidate_id=decision.candidate_id,
+            parent_request_id=decision.parent_request_id,
+            question=question,
+            reference=candidate.reference_content,
+            status=EligibilityStatus.INELIGIBLE,
+            judge_method=f"{decision.judge_method}:task_scope",
+            judge_model_fingerprint=decision.judge_model_fingerprint,
+            decision_margin=0.0,
+        )
 
     def _exact_task_reflection_candidates(
         self, original_task: str, query: str
@@ -587,11 +626,11 @@ class SelfAskRefreshService:
                     if (candidate.lane, candidate.document_id) not in known_documents
                 )
                 raw_proposed = (*raw_proposed, *exact_task_candidates)
-                raw_proposed, task_scope_filtered_count = (
-                    self._filter_task_scoped_reflections(
-                        tuple(raw_proposed), user_question
-                    )
+                task_scope_filtered_keys = self._task_scope_filtered_keys(
+                    tuple(raw_proposed), user_question
                 )
+                task_scope_filtered_key_set = frozenset(task_scope_filtered_keys)
+                task_scope_filtered_count = len(task_scope_filtered_keys)
                 deduplicated: list[KnowledgeCandidate] = []
                 seen_candidates: set[tuple[str, str]] = set()
                 for candidate in raw_proposed:
@@ -633,9 +672,9 @@ class SelfAskRefreshService:
                             ),
                             candidate.document_id,
                         ),
-                    )[: self.max_candidates]
+                    )
                 )
-                knowledge_candidates = tuple(
+                knowledge_ranked = tuple(
                     sorted(
                         (
                             candidate
@@ -655,7 +694,23 @@ class SelfAskRefreshService:
                             ),
                             candidate.document_id,
                         ),
-                    )[: self.max_candidates]
+                    )
+                )
+                knowledge_qk = tuple(
+                    candidate
+                    for candidate in knowledge_ranked
+                    if candidate.candidate_origin == "attention_q_native_tensor_bank"
+                )
+                knowledge_supplemental = tuple(
+                    candidate
+                    for candidate in knowledge_ranked
+                    if candidate.candidate_origin != "attention_q_native_tensor_bank"
+                )
+                knowledge_candidates = (
+                    *knowledge_qk,
+                    *knowledge_supplemental[
+                        : max(0, self.max_candidates - len(knowledge_qk))
+                    ],
                 )
                 bypassed_knowledge_candidates: tuple[KnowledgeCandidate, ...] = ()
                 judged_candidates = (
@@ -667,20 +722,19 @@ class SelfAskRefreshService:
                     *qk_policy_candidates,
                     *knowledge_candidates,
                 )
-                judged_references = None
-                if judged_candidates:
-                    judged_references = await self.judge.judge(
-                        parent_request_id=parent_request_id,
-                        turn_id=f"{turn_id}:refresh-judge",
-                        question=self_question,
-                        candidates=judged_candidates,
-                        telemetry_correlation_id=f"{parent_request_id}:refresh",
-                    )
+                judged_references, judge_wave_count = await self._judge_in_waves(
+                    parent_request_id=parent_request_id,
+                    turn_id=f"{turn_id}:refresh-judge",
+                    question=self_question,
+                    candidates=judged_candidates,
+                    telemetry_correlation_id=f"{parent_request_id}:refresh",
+                )
                 eligible_judged = self._eligible_from_batch(
                     parent_request_id,
                     self_question,
                     judged_candidates,
                     judged_references,
+                    task_scope_filtered_key_set,
                 )
                 if self.tensor_bank is not None and eligible_judged:
                     bind_native_prefix = getattr(
@@ -713,10 +767,27 @@ class SelfAskRefreshService:
                     *bypassed_knowledge_candidates,
                     *eligible_judged,
                 )
-                judged_decisions = (
+                raw_decisions = (
                     tuple(judged_references.decisions)
                     if judged_references is not None
                     else ()
+                )
+                raw_decisions_by_id = {
+                    decision.candidate_id: decision for decision in raw_decisions
+                }
+                judged_decisions = tuple(
+                    (
+                        self._scope_gate_decision(
+                            raw_decisions_by_id[candidate.candidate_id],
+                            candidate,
+                            self_question,
+                        )
+                        if self._candidate_scope_key(candidate)
+                        in task_scope_filtered_key_set
+                        else raw_decisions_by_id[candidate.candidate_id]
+                    )
+                    for candidate in judged_candidates
+                    if candidate.candidate_id in raw_decisions_by_id
                 )
                 eligibility_decisions = judged_decisions
                 decision_ids = tuple(
@@ -745,6 +816,23 @@ class SelfAskRefreshService:
                             *(["policydata"] if direct_candidates else []),
                         ],
                         "task_scope_category": reflection_task_category(user_question),
+                        "task_scope_blocked_count": task_scope_filtered_count,
+                        "qk_candidate_count": sum(
+                            candidate.candidate_origin
+                            == "attention_q_native_tensor_bank"
+                            for candidate in proposed
+                        ),
+                        "qk_sent_to_judge": sum(
+                            candidate.candidate_origin
+                            == "attention_q_native_tensor_bank"
+                            for candidate in judged_candidates
+                        ),
+                        "task_scope_filtered_candidate_ids": [
+                            candidate.candidate_id
+                            for candidate in proposed
+                            if self._candidate_scope_key(candidate)
+                            in task_scope_filtered_key_set
+                        ],
                         "task_scope_filtered_count": task_scope_filtered_count,
                         "task_scope_exact_candidate_count": len(exact_task_candidates),
                     },
@@ -755,11 +843,33 @@ class SelfAskRefreshService:
                     {
                         "event_id": event.event_id if event is not None else None,
                         "candidate_count": len(judged_candidates),
+                        "qk_candidate_count": sum(
+                            candidate.candidate_origin
+                            == "attention_q_native_tensor_bank"
+                            for candidate in judged_candidates
+                        ),
                         "valid_count": (
                             judged_references.valid_count
                             if judged_references is not None
                             else 0
                         ),
+                        "selection_method": (
+                            judged_references.selection_method
+                            if judged_references is not None
+                            else "not_run"
+                        ),
+                        "judge_wave_count": judge_wave_count,
+                        "task_scope_blocked_count": sum(
+                            self._candidate_scope_key(candidate)
+                            in task_scope_filtered_key_set
+                            for candidate in judged_candidates
+                        ),
+                        "task_scope_blocked_candidate_ids": [
+                            candidate.candidate_id
+                            for candidate in judged_candidates
+                            if self._candidate_scope_key(candidate)
+                            in task_scope_filtered_key_set
+                        ],
                         "eligible_count": len(eligible_judged),
                         "bypassed_count": len(direct_candidates),
                         "cache_hit_count": (
@@ -1756,12 +1866,72 @@ class SelfAskRefreshService:
             for index, text, normalized, overlap in selected
         )
 
+    async def _judge_in_waves(
+        self,
+        *,
+        parent_request_id: str,
+        turn_id: str,
+        question: str,
+        candidates: tuple[KnowledgeCandidate, ...],
+        telemetry_correlation_id: str,
+    ) -> tuple[JudgeBatchResult | None, int]:
+        if not candidates:
+            return None, 0
+        runner_fanout = max(
+            1,
+            int(getattr(self.runner, "max_fanout", self.max_candidates)),
+        )
+        token_budget = max(1, int(getattr(self.judge, "token_budget", 1)))
+        token_capacity = max(
+            1,
+            int(getattr(self.runner, "max_tokens_per_parent", token_budget))
+            // token_budget,
+        )
+        wave_size = max(1, min(runner_fanout, token_capacity))
+        batches: list[Any] = []
+        for wave_index in range(0, len(candidates), wave_size):
+            wave = candidates[wave_index : wave_index + wave_size]
+            batches.append(
+                await self.judge.judge(
+                    parent_request_id=parent_request_id,
+                    turn_id=f"{turn_id}:wave-{wave_index // wave_size}",
+                    question=question,
+                    candidates=wave,
+                    telemetry_correlation_id=(
+                        f"{telemetry_correlation_id}:wave-{wave_index // wave_size}"
+                    ),
+                )
+            )
+        if len(batches) == 1:
+            return batches[0], 1
+        decision_by_id = {}
+        for batch in batches:
+            decision_by_id.update(
+                {decision.candidate_id: decision for decision in batch.decisions}
+            )
+        decisions = tuple(
+            decision_by_id[candidate.candidate_id]
+            for candidate in candidates
+            if candidate.candidate_id in decision_by_id
+        )
+        return (
+            JudgeBatchResult.combine(
+                candidates,
+                batches,
+                decisions,
+                selected_candidate_id=None,
+                selection_method="independent_binary_waves",
+            ),
+            len(batches),
+        )
+
     @staticmethod
     def _eligible_from_batch(
         parent_request_id: str,
         question: str,
         candidates: tuple[KnowledgeCandidate, ...],
         batch: Any | None,
+        blocked_keys: frozenset[tuple[str, str, str]] = frozenset(),
     ) -> tuple[KnowledgeCandidate, ...]:
         if batch is None:
             return ()
@@ -1773,7 +1943,9 @@ class SelfAskRefreshService:
             candidate
             for candidate in candidates
             if (
-                (decision := decisions_by_candidate.get(candidate.candidate_id))
+                SelfAskRefreshService._candidate_scope_key(candidate)
+                not in blocked_keys
+                and (decision := decisions_by_candidate.get(candidate.candidate_id))
                 is not None
                 and decision.status is EligibilityStatus.ELIGIBLE
                 and decision.parent_request_id == parent_request_id

@@ -288,6 +288,57 @@ def test_refresh_filters_task_scoped_reflection_from_another_task(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_refresh_reviews_but_blocks_scope_mismatched_reflection(tmp_path):
+    service, repo = build_service(tmp_path, FakeManager(all_supported=True))
+    target_task = "Please solve this issue: add implicit HEAD and OPTIONS routing"
+    other_task = "Please solve this issue: add deprecated response headers"
+
+    def add_reflection(path, task, body):
+        return repo.upsert(
+            path,
+            "---\nsource_kind: trajectory_reflection\n"
+            "document_group: reflection_memory\nreflection_memory_schema: 3\n"
+            f"retrieval_category: {reflection_task_category(task)}\n---\n\n{body}",
+        )
+
+    add_reflection("reflection-memory/target.md", target_task, "Safe rule.")
+    other = add_reflection(
+        "reflection-memory/other.md", other_task, "Out-of-scope rule."
+    )
+    other_candidate = replace(
+        repo.candidate_for_document(other.document_id, "qk"),
+        tensor_score=0.9,
+        score=0.9,
+        lexical_score=0.0,
+        candidate_origin="attention_q_native_tensor_bank",
+    )
+
+    record = await service.refresh(
+        parent_request_id="request-refresh-scope",
+        turn_id="turn-refresh-scope",
+        user_question=target_task,
+        partial_output="The exact rule is uncertain.",
+        candidates=(other_candidate,),
+    )
+
+    assert record.status == "semantic_ready"
+    decisions = service.eligibility_decisions("request-refresh-scope")
+    other_decision = next(
+        decision
+        for decision in decisions
+        if decision.candidate_id == other_candidate.candidate_id
+    )
+    assert other_decision.status is EligibilityStatus.INELIGIBLE
+    assert other_decision.judge_method.endswith(":task_scope")
+    completed = [
+        event.payload
+        for event in service.telemetry.events("request-refresh-scope")
+        if event.event_type == "semantic_judge.completed"
+    ]
+    assert completed[-1]["task_scope_blocked_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_tensor_refresh_forwards_resolved_admission_margin(tmp_path):
     bank = RecordingTensorBank()
     service, _repo = build_service(
@@ -740,6 +791,49 @@ async def test_qk_policydata_requires_semantic_applicability_judge(tmp_path):
     ]
     assert completed[-1]["candidate_count"] == 1
     assert completed[-1]["bypassed_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_judges_all_qk_candidates_in_bounded_waves(tmp_path):
+    manager = FakeManager(all_supported=True)
+    service, repo = build_service(tmp_path, manager)
+    for index in range(8):
+        repo.upsert(f"extra-{index}.md", f"Reference detail {index}.")
+    candidates = tuple(
+        replace(
+            repo.candidate_for_document(document.document_id, "qk-refresh"),
+            score=0.99 - index * 0.01,
+            lexical_score=0.0,
+            tensor_score=0.99 - index * 0.01,
+            candidate_origin="attention_q_native_tensor_bank",
+        )
+        for index, document in enumerate(repo.snapshot.documents)
+    )
+
+    record = await service.refresh(
+        parent_request_id="request-qk-waves",
+        turn_id="turn-qk-waves",
+        user_question="Which reference is applicable?",
+        partial_output="Several references may apply.",
+        candidates=candidates,
+    )
+
+    assert record.status == "semantic_ready"
+    assert len(record.candidate_ids) == len(candidates)
+    judge_requests = [
+        request
+        for request in manager.requests
+        if request.text and "Judge whether the supplied candidate" in request.text[0]
+    ]
+    assert [len(request.text) for request in judge_requests] == [8, 2]
+    completed = [
+        event.payload
+        for event in service.telemetry.events("request-qk-waves")
+        if event.event_type == "semantic_judge.completed"
+    ]
+    assert completed[-1]["candidate_count"] == len(candidates)
+    assert completed[-1]["judge_wave_count"] == 2
+    assert completed[-1]["qk_candidate_count"] == len(candidates)
 
 
 @pytest.mark.asyncio
