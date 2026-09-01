@@ -87,10 +87,12 @@ class TestDFlashActiveBatchIsolation(unittest.TestCase):
         )
 
     @staticmethod
-    def _batch(reqs, *, target_only):
+    def _batch(reqs, *, target_only, spec_info=None):
         return SimpleNamespace(
             reqs=reqs,
+            is_empty=lambda: not reqs,
             spec_algorithm=SimpleNamespace(is_none=lambda: target_only),
+            spec_info=spec_info,
         )
 
     def test_batch_mode_blocks_opposite_lane_when_request_metadata_is_stale(self):
@@ -107,6 +109,36 @@ class TestDFlashActiveBatchIsolation(unittest.TestCase):
             Scheduler._dflash_active_request_flags(running_batch, last_batch),
             (True, True),
         )
+
+    def test_incompatible_batch_lanes_are_not_mergeable(self):
+        speculative_batch = self._batch(
+            [self._request("user")],
+            target_only=False,
+        )
+        target_only_batch = self._batch(
+            [self._request("internal")],
+            target_only=True,
+        )
+
+        self.assertFalse(
+            Scheduler._dflash_batches_are_compatible(
+                speculative_batch, target_only_batch
+            )
+        )
+
+    def test_same_batch_lane_is_mergeable(self):
+        left = self._batch([self._request("user")], target_only=False)
+        right = self._batch([self._request("user")], target_only=False)
+
+        self.assertTrue(Scheduler._dflash_batches_are_compatible(left, right))
+
+    def test_spec_metadata_mismatch_is_not_mergeable(self):
+        left = self._batch(
+            [self._request("user")], target_only=False, spec_info=object()
+        )
+        right = self._batch([self._request("user")], target_only=False)
+
+        self.assertFalse(Scheduler._dflash_batches_are_compatible(left, right))
 
 
 if __name__ == "__main__":
