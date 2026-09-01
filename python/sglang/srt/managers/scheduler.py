@@ -3568,17 +3568,6 @@ class Scheduler(
                     self._advance_qwen_exo_decode_state(req)
                 if running_batch.is_empty():
                     running_batch = last_batch
-                elif (
-                    self.enable_overlap
-                    and self.spec_algorithm.is_dflash()
-                    and not self._dflash_batches_are_compatible(
-                        running_batch, last_batch
-                    )
-                ):
-                    # Keep opposite lanes separate. Returning no new batch
-                    # makes the overlap loop drain last_batch's result before
-                    # the next scheduling pass.
-                    return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
                 else:
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
@@ -3653,17 +3642,21 @@ class Scheduler(
     def _dflash_active_request_flags(
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch] = None,
+        preselected_requests: Iterable[Req] = (),
     ) -> Tuple[bool, bool]:
-        """Return target-only/non-target presence across in-flight batches.
+        """Return target-only/non-target presence across in-flight work.
 
         Request metadata is the admission source of truth, but a batch's
         ``spec_algorithm`` is authoritative once that batch has been created.
-        Keep both signals so a request whose grammar/hidden-state metadata
-        changes while it is in flight cannot open an incompatible lane.
+        ``preselected_requests`` covers a chunked request already placed in the
+        PrefillAdder before the waiting queue is filtered.
         """
         active_requests = [req for req in running_batch.reqs if not req.finished()]
         if last_batch is not None and last_batch is not running_batch:
             active_requests.extend(req for req in last_batch.reqs if not req.finished())
+        active_requests.extend(
+            req for req in preselected_requests if not req.finished()
+        )
         has_target_only = bool(active_requests) and all(
             is_dflash_target_only_request(req) for req in active_requests
         )
@@ -3691,36 +3684,6 @@ class Scheduler(
                 has_non_target_only = True
 
         return has_target_only, has_non_target_only
-
-    @classmethod
-    def _dflash_batches_are_compatible(
-        cls,
-        left_batch: ScheduleBatch,
-        right_batch: ScheduleBatch,
-    ) -> bool:
-        """Return whether two in-flight batches can share one DFLASH lane."""
-        if left_batch is right_batch or left_batch.is_empty() or right_batch.is_empty():
-            return True
-
-        left_target_only, left_non_target_only = cls._dflash_active_request_flags(
-            left_batch
-        )
-        right_target_only, right_non_target_only = cls._dflash_active_request_flags(
-            right_batch
-        )
-        if (left_target_only and right_non_target_only) or (
-            left_non_target_only and right_target_only
-        ):
-            return False
-
-        def is_speculative(batch: ScheduleBatch) -> bool:
-            algorithm = getattr(batch, "spec_algorithm", None)
-            is_none = getattr(algorithm, "is_none", None)
-            return not callable(is_none) or not is_none()
-
-        if is_speculative(left_batch) != is_speculative(right_batch):
-            return False
-        return (left_batch.spec_info is None) == (right_batch.spec_info is None)
 
     def get_new_batch_prefill(
         self,
@@ -3865,13 +3828,16 @@ class Scheduler(
                 )
 
         rejected_qwen_reqs: List[Req] = []
-        (
-            active_running_has_target_only,
-            active_running_has_non_target_only,
-        ) = self._dflash_active_request_flags(running_batch, last_batch)
+        active_has_target_only, active_has_non_target_only = (
+            self._dflash_active_request_flags(
+                running_batch,
+                last_batch,
+                preselected_requests=adder.can_run_list,
+            )
+        )
         target_only_waiting = (
             self.spec_algorithm.is_dflash()
-            and not active_running_has_target_only
+            and not active_has_target_only
             and any(is_dflash_target_only_request(item) for item in self.waiting_queue)
         )
 
@@ -3887,8 +3853,8 @@ class Scheduler(
             )
 
             if (
-                (target_only_req and active_running_has_non_target_only)
-                or (not target_only_req and active_running_has_target_only)
+                (target_only_req and active_has_non_target_only)
+                or (not target_only_req and active_has_target_only)
                 or (target_only_waiting and not target_only_req)
             ):
                 continue
