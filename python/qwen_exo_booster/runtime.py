@@ -34,7 +34,12 @@ from qwen_exo_booster.causal_replay import CausalReplayService
 from qwen_exo_booster.config import PROJECT_NAME, QwenExoConfig, qk_recall_gates
 from qwen_exo_booster.cognition import CognitionRepository
 from qwen_exo_booster.document_categories import DocumentCategoryStore
-from qwen_exo_booster.contracts import stable_digest
+from qwen_exo_booster.contracts import (
+    CancellationToken,
+    InternalJob,
+    InternalJobType,
+    stable_digest,
+)
 from qwen_exo_booster.knowledge import (
     is_compatible_reflection_memory,
     set_markdown_retrieval_category,
@@ -108,6 +113,13 @@ def _query_probe_timeout_seconds(tokenizer_manager: Any) -> float:
     server_args = getattr(tokenizer_manager, "server_args", None)
     algorithm = str(getattr(server_args, "speculative_algorithm", "") or "").upper()
     return 120.0 if algorithm == "DFLASH" else 30.0
+
+_STARTUP_GENERATION_WARMUP_PARENT_ID = "runtime"
+_STARTUP_GENERATION_WARMUP_JOB_ID = "qwen-exo-startup-generation-warmup"
+_STARTUP_GENERATION_WARMUP_PROMPT = (
+    "Warm up the internal generation path. Return a short neutral readiness word."
+)
+_STARTUP_GENERATION_WARMUP_TOKENS = 64
 
 
 _SELF_QUESTION_STOP_WORDS = frozenset(
@@ -615,35 +627,119 @@ class QwenExoRuntime:
         return payload
 
     async def _run_startup_warmup(self) -> None:
-        if self.query_probe is None:
+        if self.query_probe is not None:
+            started = time.perf_counter()
+            result = await self.query_probe.warmup()
+            elapsed = time.perf_counter() - started
+            self.telemetry.emit(
+                "runtime",
+                "runtime.startup_warmup",
+                {
+                    "query_probe_status": result.status,
+                    "query_probe_prompt_tokens": result.prompt_tokens,
+                    "query_probe_latency_seconds": result.latency_seconds,
+                    "elapsed_seconds": elapsed,
+                    "cache_hit": result.cache_hit,
+                },
+            )
+            if result.status == "failed_closed":
+                logger.warning(
+                    "QWEN_EXO_STARTUP_WARMUP failed closed status=%s elapsed=%.3fs",
+                    result.status,
+                    elapsed,
+                )
+            else:
+                logger.info(
+                    "QWEN_EXO_STARTUP_WARMUP status=%s prompt_tokens=%d elapsed=%.3fs",
+                    result.status,
+                    result.prompt_tokens,
+                    elapsed,
+                )
+        await self._run_startup_generation_warmup()
+
+    async def _run_startup_generation_warmup(self) -> None:
+        runner = getattr(self, "internal_jobs", None)
+        run_batch = getattr(runner, "run_batch", None)
+        if not callable(run_batch):
             return
         started = time.perf_counter()
-        result = await self.query_probe.warmup()
-        elapsed = time.perf_counter() - started
-        self.telemetry.emit(
-            "runtime",
-            "runtime.startup_warmup",
-            {
-                "query_probe_status": result.status,
-                "query_probe_prompt_tokens": result.prompt_tokens,
-                "query_probe_latency_seconds": result.latency_seconds,
-                "elapsed_seconds": elapsed,
-                "cache_hit": result.cache_hit,
-            },
+        parent_id = _STARTUP_GENERATION_WARMUP_PARENT_ID
+        job_id = _STARTUP_GENERATION_WARMUP_JOB_ID
+        job = InternalJob(
+            parent_request_id=parent_id,
+            turn_id=f"{parent_id}:startup-generation-warmup",
+            job_id=job_id,
+            job_type=InternalJobType.SELF_ANSWER,
+            priority=-30,
+            shared_prefix_key="qwen-exo:v1:startup:warmup",
+            token_budget=_STARTUP_GENERATION_WARMUP_TOKENS,
+            state_budget_bytes=0,
+            deadline_monotonic=time.monotonic()
+            + max(
+                300.0,
+                _query_probe_timeout_seconds(
+                    getattr(self, "tokenizer_manager", None)
+                ),
+            ),
+            cancellation_token=CancellationToken(
+                f"cancel:{parent_id}:startup-generation-warmup"
+            ),
+            telemetry_correlation_id=f"{parent_id}:startup-generation-warmup",
+            max_fanout=1,
         )
-        if result.status == "failed_closed":
+        try:
+            result = (
+                await run_batch(
+                    (job,),
+                    (_STARTUP_GENERATION_WARMUP_PROMPT,),
+                    {
+                        "temperature": 0.7,
+                        "top_p": 0.95,
+                        "top_k": 20,
+                        "custom_params": {
+                            "qwen_exo_dflash": "eligible",
+                            "qwen_exo_dflash_think_phase": False,
+                        },
+                    },
+                )
+            )[0]
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            emit = getattr(getattr(self, "telemetry", None), "emit", None)
+            if callable(emit):
+                emit(
+                    "runtime",
+                    "runtime.startup_generation_warmup",
+                    {
+                        "status": "failed_closed",
+                        "error_type": type(exc).__name__,
+                        "elapsed_seconds": time.perf_counter() - started,
+                    },
+                )
             logger.warning(
-                "QWEN_EXO_STARTUP_WARMUP failed closed status=%s elapsed=%.3fs",
-                result.status,
-                elapsed,
+                "QWEN_EXO_STARTUP_GENERATION_WARMUP failed closed: %s", exc
             )
-        else:
-            logger.info(
-                "QWEN_EXO_STARTUP_WARMUP status=%s prompt_tokens=%d elapsed=%.3fs",
-                result.status,
-                result.prompt_tokens,
-                elapsed,
-            )
+            return
+        payload = {
+            "status": "ready",
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+            "latency_seconds": result.latency_seconds,
+            "elapsed_seconds": time.perf_counter() - started,
+            "finish_reason": result.finish_reason,
+            "dflash_requested": True,
+        }
+        emit = getattr(getattr(self, "telemetry", None), "emit", None)
+        if callable(emit):
+            emit("runtime", "runtime.startup_generation_warmup", payload)
+        logger.info(
+            "QWEN_EXO_STARTUP_GENERATION_WARMUP status=ready prompt_tokens=%d "
+            "completion_tokens=%d elapsed=%.3fs",
+            result.prompt_tokens,
+            result.completion_tokens,
+            time.perf_counter() - started,
+        )
 
     async def start(self, *, run_startup_warmup: bool = True) -> None:
         async with self._lifecycle_lock:

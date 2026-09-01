@@ -625,6 +625,53 @@ def test_runtime_startup_warmup_records_native_probe_result():
     assert events[0][2]["cache_hit"] is False
 
 
+def test_runtime_startup_generation_warmup_uses_reserved_internal_job():
+    calls = []
+    events = []
+
+    class Runner:
+        async def run_batch(self, jobs, prompts, sampling_params, **kwargs):
+            calls.append((tuple(jobs), tuple(prompts), sampling_params, kwargs))
+            return (
+                SimpleNamespace(
+                    prompt_tokens=12,
+                    completion_tokens=8,
+                    latency_seconds=0.25,
+                    finish_reason={"type": "length"},
+                ),
+            )
+
+    runtime = object.__new__(QwenExoRuntime)
+    runtime.internal_jobs = Runner()
+    runtime.tokenizer_manager = SimpleNamespace(
+        server_args=SimpleNamespace(speculative_algorithm="DFLASH")
+    )
+    runtime.telemetry = SimpleNamespace(
+        emit=lambda request_id, event_type, payload: events.append(
+            (request_id, event_type, payload)
+        )
+    )
+
+    asyncio.run(runtime._run_startup_generation_warmup())
+
+    assert len(calls) == 1
+    jobs, prompts, sampling_params, kwargs = calls[0]
+    assert len(jobs) == 1
+    assert jobs[0].parent_request_id == "runtime"
+    assert jobs[0].job_id == "qwen-exo-startup-generation-warmup"
+    assert jobs[0].job_type.value == "self_answer"
+    assert jobs[0].shared_prefix_key == "qwen-exo:v1:startup:warmup"
+    assert prompts[0].startswith("Warm up the internal generation path.")
+    assert sampling_params["custom_params"] == {
+        "qwen_exo_dflash": "eligible",
+        "qwen_exo_dflash_think_phase": False,
+    }
+    assert kwargs == {}
+    assert events[0][0:2] == ("runtime", "runtime.startup_generation_warmup")
+    assert events[0][2]["status"] == "ready"
+    assert events[0][2]["dflash_requested"] is True
+
+
 def test_runtime_builds_think_context_from_real_refresh_record():
     record = RefreshRecord(
         parent_request_id="request-real",
