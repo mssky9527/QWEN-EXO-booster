@@ -579,6 +579,7 @@ class ReflectionMemoryService:
             Callable[[str, str], Awaitable[tuple[ReflectionMemoryCandidate, ...]]]
             | None
         ) = None,
+        on_memory_stored: Callable[[ReflectionMemory], Awaitable[None]] | None = None,
     ):
         if mode not in {"off", "active"}:
             raise ValueError("Reflection memory mode must be off/active")
@@ -606,6 +607,7 @@ class ReflectionMemoryService:
         self.source_store = source_store
         self.publish = publish
         self.retrieve_similar = retrieve_similar
+        self.on_memory_stored = on_memory_stored
 
     async def reflect(
         self,
@@ -842,6 +844,8 @@ class ReflectionMemoryService:
                     )
                 if self.store is not None:
                     self.store.append(reflection)
+                if self.on_memory_stored is not None:
+                    await self.on_memory_stored(reflection)
                 self.telemetry.emit(
                     parent_id,
                     "reflection_memory.completed",

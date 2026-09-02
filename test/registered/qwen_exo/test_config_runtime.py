@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -563,7 +564,7 @@ def test_runtime_creates_authoritative_directories(tmp_path, monkeypatch):
         "source_digest": runtime.cognition.snapshot.source_digest,
         "document_count": 0,
         "always_on": False,
-        "route": "native_tensor_bank_conditioning",
+        "route": "text_instructions",
         "qk_ranked": False,
     }
     assert runtime.status()["policy_data"] == {
@@ -574,7 +575,7 @@ def test_runtime_creates_authoritative_directories(tmp_path, monkeypatch):
         "semantic_eligibility_required": False,
         "qk_relevance_required": False,
         "reference_judge_required": False,
-        "route": "attention_q_native_tensor_bank",
+        "route": "text_instructions",
         "max_tokens": runtime.config.max_policy_tokens,
     }
     assert runtime.status()["internal_services"] == {
@@ -616,28 +617,40 @@ def test_runtime_startup_warmup_records_native_probe_result():
         )
     )
 
+    async def generation_warmup():
+        calls.append("generation_warmup")
+
+    runtime._run_startup_generation_warmup = generation_warmup
+
     asyncio.run(runtime._run_startup_warmup())
 
-    assert calls == ["warmup"]
+    assert calls == ["warmup", "generation_warmup"]
     assert events[0][0:2] == ("runtime", "runtime.startup_warmup")
     assert events[0][2]["query_probe_status"] == "ready"
     assert events[0][2]["query_probe_prompt_tokens"] == 264
     assert events[0][2]["cache_hit"] is False
 
 
-def test_runtime_startup_generation_warmup_uses_reserved_internal_job():
-    calls = []
+def test_startup_without_memories_serves_without_initial_gdn():
+    """A fresh deployment has no reflection memories and must still come up.
+
+    With an empty store the consolidation has nothing to prefill: the runtime
+    records ``no_memory``, keeps the neutral generation warmup, and hands out
+    no selection so requests run from a zero recurrent state instead of
+    failing closed.
+    """
+    jobs_run = []
     events = []
 
     class Runner:
         async def run_batch(self, jobs, prompts, sampling_params, **kwargs):
-            calls.append((tuple(jobs), tuple(prompts), sampling_params, kwargs))
+            jobs_run.append(tuple(jobs))
             return (
                 SimpleNamespace(
                     prompt_tokens=12,
-                    completion_tokens=8,
-                    latency_seconds=0.25,
-                    finish_reason={"type": "length"},
+                    completion_tokens=3,
+                    latency_seconds=0.1,
+                    finish_reason={"type": "stop"},
                 ),
             )
 
@@ -646,6 +659,69 @@ def test_runtime_startup_generation_warmup_uses_reserved_internal_job():
     runtime.tokenizer_manager = SimpleNamespace(
         server_args=SimpleNamespace(speculative_algorithm="DFLASH")
     )
+    runtime._session_initial_gdn_refresh_lock = asyncio.Lock()
+    runtime._session_initial_gdn_value_lock = threading.RLock()
+    runtime._session_initial_gdn_value = None
+    runtime._session_initial_gdn_status = {"status": "not_started"}
+    runtime._build_session_initial_gdn_prompt = lambda: None
+    runtime.telemetry = SimpleNamespace(
+        emit=lambda request_id, event_type, payload: events.append(
+            (event_type, payload)
+        )
+    )
+
+    asyncio.run(runtime._run_startup_generation_warmup())
+
+    assert runtime._session_initial_gdn_status["status"] == "no_memory"
+    assert runtime.initial_gdn_selection() is None
+    assert [job.job_id for batch in jobs_run for job in batch] == [
+        "qwen-exo-startup-generation-warmup"
+    ]
+    assert events[-1][0] == "runtime.startup_generation_warmup"
+    assert events[-1][1]["session_initial_gdn"] is False
+
+
+def test_runtime_startup_generation_builds_global_session_gdn(tmp_path):
+    calls = []
+    finished = []
+    events = []
+
+    class Runner:
+        async def run_batch(self, jobs, prompts, sampling_params, **kwargs):
+            calls.append((tuple(jobs), tuple(prompts), sampling_params, kwargs))
+            return (
+                SimpleNamespace(
+                    text="consolidated reflection",
+                    prompt_tokens=60,
+                    completion_tokens=16,
+                    latency_seconds=0.25,
+                    finish_reason={"type": "stop"},
+                    metadata={"qwen_exo_session_initial_gdn_status": ["exported"]},
+                ),
+            )
+
+        async def finish_parent(self, parent_id):
+            finished.append(parent_id)
+
+    runtime = object.__new__(QwenExoRuntime)
+    runtime.internal_jobs = Runner()
+    runtime.config = SimpleNamespace(
+        context_length=128, max_internal_tokens=32, state_directory=tmp_path
+    )
+    runtime._session_initial_gdn_refresh_lock = asyncio.Lock()
+    runtime._session_initial_gdn_value_lock = threading.RLock()
+    runtime._session_initial_gdn_value = None
+    runtime._session_initial_gdn_status = {"status": "not_started"}
+    runtime._build_session_initial_gdn_prompt = lambda: {
+        "prompt": "rendered recent memories",
+        "prompt_tokens": 60,
+        "source_tokens": 40,
+        "input_budget": 64,
+        "source_digest": "a" * 64,
+        "state_identity": "b" * 64,
+        "memory_count": 2,
+        "available_memory_count": 3,
+    }
     runtime.telemetry = SimpleNamespace(
         emit=lambda request_id, event_type, payload: events.append(
             (request_id, event_type, payload)
@@ -656,20 +732,210 @@ def test_runtime_startup_generation_warmup_uses_reserved_internal_job():
 
     assert len(calls) == 1
     jobs, prompts, sampling_params, kwargs = calls[0]
-    assert len(jobs) == 1
-    assert jobs[0].parent_request_id == "runtime"
-    assert jobs[0].job_id == "qwen-exo-startup-generation-warmup"
-    assert jobs[0].job_type.value == "self_answer"
-    assert jobs[0].shared_prefix_key == "qwen-exo:v1:startup:warmup"
-    assert prompts[0].startswith("Warm up the internal generation path.")
+    assert jobs[0].job_type.value == "reflection_memory"
+    assert jobs[0].deadline_monotonic is None
+    assert prompts == ("rendered recent memories",)
+    # Speculative decoding stays off so the exported recurrent state is fully
+    # flushed; the consolidation itself thinks before writing the reflection.
     assert sampling_params["custom_params"] == {
-        "qwen_exo_dflash": "eligible",
-        "qwen_exo_dflash_think_phase": False,
+        "qwen_exo_dflash": "target_only",
+        "qwen_exo_dflash_think_phase": True,
     }
-    assert kwargs == {}
-    assert events[0][0:2] == ("runtime", "runtime.startup_generation_warmup")
-    assert events[0][2]["status"] == "ready"
-    assert events[0][2]["dflash_requested"] is True
+    assert kwargs["custom_params_per_job"] == (
+        {
+            "qwen_exo_session_initial_gdn_export": {
+                "source_digest": "a" * 64,
+                "state_identity": "b" * 64,
+            }
+        },
+    )
+    assert finished == [jobs[0].parent_request_id]
+    assert runtime._session_initial_gdn_value["state_identity"] == "b" * 64
+    assert runtime._session_initial_gdn_value["truncated"] is False
+    assert runtime._session_initial_gdn_status["status"] == "ready"
+    assert [event[1] for event in events] == [
+        "runtime.session_initial_gdn_updated",
+        "runtime.session_initial_gdn_generation",
+        "runtime.startup_generation_warmup",
+    ]
+    sidecar = json.loads(
+        (tmp_path / "session-initial-gdn" / f"{'b' * 64}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sidecar["reflection"] == "consolidated reflection"
+    assert sidecar["finish_reason"] == "stop"
+
+
+class _CharacterTokenizer:
+    def __init__(self):
+        self.template_kwargs = []
+
+    @staticmethod
+    def encode(value, add_special_tokens=False):
+        del add_special_tokens
+        return [ord(character) for character in str(value)]
+
+    @staticmethod
+    def decode(values, **_kwargs):
+        return "".join(chr(int(value)) for value in values)
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.template_kwargs.append(kwargs)
+        return "\n".join(str(message["content"]) for message in messages)
+
+
+def _session_gdn_prompt_runtime(records, *, context_length):
+    runtime = object.__new__(QwenExoRuntime)
+    runtime.config = SimpleNamespace(context_length=context_length)
+    runtime.tokenizer_manager = SimpleNamespace(tokenizer=_CharacterTokenizer())
+    runtime.model_identity = SimpleNamespace(fingerprint="model-fingerprint")
+    runtime.reflection_memory_store = SimpleNamespace(list=lambda: list(records))
+    return runtime
+
+
+def test_session_initial_gdn_prompt_is_newest_first_and_half_context_bounded():
+    runtime = _session_gdn_prompt_runtime(
+        [
+            {
+                "source_digest": "old",
+                "created_at": 1.0,
+                "title": "OLD_MEMORY_MARKER",
+                "reflection": "old evidence",
+            },
+            {
+                "source_digest": "new",
+                "created_at": 2.0,
+                "title": "NEW_MEMORY_MARKER",
+                "reflection": "new evidence",
+            },
+        ],
+        context_length=8000,
+    )
+
+    prompt = runtime._build_session_initial_gdn_prompt()
+
+    assert prompt is not None
+    assert prompt["prompt_tokens"] <= runtime.config.context_length // 2
+    assert prompt["memory_count"] == 2
+    assert prompt["memory_digests"] == ("new", "old")
+    assert prompt["prompt"].index("NEW_MEMORY_MARKER") < prompt["prompt"].index(
+        "OLD_MEMORY_MARKER"
+    )
+    # The consolidation reasons over the memories before writing the reflection.
+    tokenizer = runtime.tokenizer_manager.tokenizer
+    assert all(kw["enable_thinking"] is True for kw in tokenizer.template_kwargs)
+
+
+def test_session_initial_gdn_prompt_never_cuts_a_memory_record():
+    """Budget overflow drops whole records instead of truncating token runs.
+
+    The previous builder sliced the concatenated token stream at the budget,
+    which left the last memory as a half record. A record that does not fit
+    is skipped so older, smaller records still make it in intact.
+    """
+    runtime = _session_gdn_prompt_runtime(
+        [
+            {
+                "source_digest": "old",
+                "created_at": 1.0,
+                "title": "OLD_MEMORY_MARKER",
+                "reflection": "short",
+            },
+            {
+                "source_digest": "new",
+                "created_at": 2.0,
+                "title": "NEW_MEMORY_MARKER",
+                "reflection": "x" * 5000,
+            },
+        ],
+        context_length=8000,
+    )
+
+    prompt = runtime._build_session_initial_gdn_prompt()
+
+    assert prompt is not None
+    assert prompt["prompt_tokens"] <= 4000
+    assert prompt["memory_count"] == 1
+    assert prompt["memory_digests"] == ("old",)
+    assert "NEW_MEMORY_MARKER" not in prompt["prompt"]
+    assert prompt["prompt"].count("<reflection_memory ") == prompt["prompt"].count(
+        "</reflection_memory>"
+    )
+
+
+def test_new_memory_refresh_runs_in_background_and_coalesces():
+    """Storing memories must not block on consolidation, and bursts coalesce.
+
+    Consolidation prefills every memory and decodes a full reflection. The
+    organization job stores several memories back to back; awaiting a refresh
+    per memory serialized minutes of generation into that job. A burst now
+    yields the running pass plus exactly one follow-up pass.
+    """
+    reasons = []
+    release = asyncio.Event()
+
+    async def refresh(*, reason):
+        reasons.append(reason)
+        await release.wait()
+
+    runtime = object.__new__(QwenExoRuntime)
+    runtime._session_initial_gdn_refresh_task = None
+    runtime._session_initial_gdn_refresh_requested = None
+    runtime._refresh_session_initial_gdn = refresh
+
+    async def scenario():
+        for _ in range(3):
+            await runtime._on_reflection_memory_stored(SimpleNamespace())
+        await asyncio.sleep(0)
+        assert reasons == ["new_memory"]
+        release.set()
+        await runtime._session_initial_gdn_refresh_task
+        assert reasons == ["new_memory", "new_memory"]
+        assert runtime._session_initial_gdn_refresh_requested is None
+
+    asyncio.run(scenario())
+
+
+def test_initial_gdn_selection_uses_global_snapshot():
+    runtime = object.__new__(QwenExoRuntime)
+    runtime._session_initial_gdn_value_lock = threading.RLock()
+    runtime._session_initial_gdn_value = {
+        "source_digest": "a" * 64,
+        "state_identity": "1" * 64,
+    }
+
+    first = runtime.initial_gdn_selection()
+    same_snapshot = runtime.initial_gdn_selection()
+    with runtime._session_initial_gdn_value_lock:
+        runtime._session_initial_gdn_value = {
+            "source_digest": "b" * 64,
+            "state_identity": "2" * 64,
+        }
+    refreshed = runtime.initial_gdn_selection()
+
+    assert first["state_identity"] == "1" * 64
+    assert same_snapshot == first
+    assert refreshed["state_identity"] == "2" * 64
+    assert refreshed["cache_namespace"] != first["cache_namespace"]
+    assert first["scope"] == "global"
+    assert refreshed["scope"] == "global"
+
+
+def test_responses_default_to_high_thinking_without_overriding_explicit_choice():
+    class Request:
+        def __init__(self, reasoning):
+            self.reasoning = reasoning
+
+        def model_copy(self, update):
+            return Request(update.get("reasoning", self.reasoning))
+
+    enabled = QwenExoRuntime._enable_default_response_thinking(Request(None))
+    explicit = SimpleNamespace(effort="none")
+    preserved = QwenExoRuntime._enable_default_response_thinking(Request(explicit))
+
+    assert enabled.reasoning.effort == "high"
+    assert preserved.reasoning is explicit
 
 
 def test_runtime_builds_think_context_from_real_refresh_record():

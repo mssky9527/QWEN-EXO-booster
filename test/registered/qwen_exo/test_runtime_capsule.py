@@ -125,7 +125,7 @@ def capture_retrieval_questions(value):
             self.states[request.request_id] = state
             return request, state
 
-        async def capture_native_attractor(self, request_id):
+        async def finalize_request_state(self, request_id):
             return self.states.get(request_id)
 
         async def get_state(self, request_id):
@@ -776,21 +776,12 @@ def test_completed_response_updates_capsule_once_and_releases_state(tmp_path):
     value.capsules = capsules
     value._request_questions["resp-1"] = "Implement WFP filter"
     value._original_tasks["resp-1"] = "Implement WFP filter"
-    attractor_calls = []
+    finalize_calls = []
 
     class FakeMemoryPipeline:
-        async def capture_native_attractor(self, request_id):
-            attractor_calls.append(request_id)
-            return SimpleNamespace(
-                public_dict=lambda: {
-                    "next_native_attractor": {
-                        "status": "ready",
-                        "lane": "knowledge",
-                        "document_id": "threejs",
-                        "page_id": 7,
-                    }
-                }
-            )
+        async def finalize_request_state(self, request_id):
+            finalize_calls.append(request_id)
+            return SimpleNamespace()
 
         async def get_state(self, _request_id):
             return None
@@ -830,13 +821,14 @@ def test_completed_response_updates_capsule_once_and_releases_state(tmp_path):
     assert update.trajectory_id == "resp-1"
     assert update.original_task == "Implement WFP filter"
     assert "verified the WFP filter" in update.assistant_reasoning
-    assert attractor_calls == ["resp-1"]
-    attractor_event = next(
+    assert finalize_calls == ["resp-1"]
+    finalized_event = next(
         event
         for event in value.telemetry_events("resp-1")
-        if event["event_type"] == "native_attractor.completed"
+        if event["event_type"] == "memory.request_state_finalized"
     )
-    assert attractor_event["payload"]["status"] == "ready"
+    assert finalized_event["payload"]["status"] == "ready"
+    assert finalized_event["payload"]["runtime_gdn_route"] == "global_initial_only"
     stage_summary = next(
         event
         for event in value.telemetry_events("resp-1")

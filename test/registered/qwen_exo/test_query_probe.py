@@ -68,10 +68,20 @@ class FakeProbeRunner:
 
 
 class FakeTokenizer:
-    @staticmethod
-    def encode(text, add_special_tokens=False):
+    def __init__(self):
+        self._tokens = {}
+
+    def encode(self, text, add_special_tokens=False):
         del add_special_tokens
-        return list(range(1, len(text.split()) + 1))
+        result = []
+        for word in str(text).split():
+            self._tokens.setdefault(word, len(self._tokens) + 1)
+            result.append(self._tokens[word])
+        return result
+
+    def decode(self, token_ids, **_kwargs):
+        reverse = {value: key for key, value in self._tokens.items()}
+        return " ".join(reverse[int(token)] for token in token_ids)
 
 
 @dataclass(frozen=True)
@@ -616,11 +626,12 @@ def test_request_memory_uses_only_query_q_and_skips_text_rankers(tmp_path):
         )
     )
 
-    assert prepared.instructions == request.instructions
+    assert request.instructions in prepared.instructions
+    assert "WFP native query key material" in prepared.instructions
     assert state.knowledge_admission_mode == "semantic_eligibility"
     assert len(state.decisions) == 1
-    assert state.radix_prefix_page_id == 3
-    assert state.radix_prefix_selection_reason == "query_qk"
+    assert state.radix_prefix_page_id is None
+    assert state.private_attachment is not None
     assert state.selected_document_ids == (document.document_id,)
     assert state.candidates[0].candidate_origin == "attention_q_native_tensor_bank"
     assert state.public_dict()["query_probe"] == {

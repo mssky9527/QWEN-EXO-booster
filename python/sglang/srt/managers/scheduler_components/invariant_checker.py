@@ -13,7 +13,6 @@ from typing import (
 )
 
 import torch
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -56,6 +55,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_reserved_mamba_slots: Callable[[], int] = lambda: 0
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -71,13 +71,16 @@ class SchedulerInvariantChecker:
         session_held: int,
         total: int,
         uncached: int = 0,
+        reserved: int = 0,
     ) -> Tuple[bool, str]:
-        """Check: available + evictable + protected + session_held + uncached == total."""
-        total_accounted = available + evictable + protected + session_held + uncached
+        """Check every allocator slot is free or owned by an explicit lifecycle."""
+        total_accounted = (
+            available + evictable + protected + session_held + uncached + reserved
+        )
         leak = total_accounted != total
         msg = (
             f"[{pool_name}] {total=}, {available=}, {evictable=}, "
-            f"{protected=}, {session_held=}, {uncached=}"
+            f"{protected=}, {session_held=}, {uncached=}, {reserved=}"
         )
         return leak, msg
 
@@ -158,6 +161,7 @@ class SchedulerInvariantChecker:
             self.tree_cache.mamba_protected_size(),
             self.pool_stats_observer.session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
+            reserved=max(0, int(self.get_reserved_mamba_slots())),
         )
         if leak:
             # Page-level leak diagnosis for mamba. Allocator flavors without
@@ -210,6 +214,7 @@ class SchedulerInvariantChecker:
             0,
             self.pool_stats_observer.session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
+            reserved=max(0, int(self.get_reserved_mamba_slots())),
         )
         int8_leak, int8_msg = self._check_pool_invariant(
             "mamba-int8",

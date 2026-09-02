@@ -303,6 +303,12 @@ export type ApiKeyInfo = {
   revoked_at: string | null;
 };
 
+export type ApiKeyDeletion = {
+  deleted: ApiKeyInfo[];
+  missing: string[];
+  revision: string;
+};
+
 export type ApiKeyListing = {
   schema: number;
   revision: string;

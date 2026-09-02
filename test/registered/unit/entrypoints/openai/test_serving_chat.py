@@ -152,25 +152,34 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
-    def test_convert_to_internal_request_binds_qwen_exo_cognition(self):
-        selection = SimpleNamespace(
-            token_ids=(91, 92),
-            page_id=7,
-            prefix_identity="cognition-prefix",
-            source_digest="c" * 64,
-            local_positions=(0, 1),
-            radix_namespace="qwen-exo:v1:cognition-prefix",
-        )
+    def _qwen_exo_runtime(self, selection, personality=None):
         runtime = SimpleNamespace(
-            memory_pipeline=SimpleNamespace(
-                tensor_bank=SimpleNamespace(
-                    cognition_selection=lambda: selection,
-                )
-            )
+            initial_gdn_selection=lambda: selection,
+            personality_instructions=lambda: personality,
+            activation_editor_request=lambda _spec: {
+                "spec": None,
+                "cache_identity": "none",
+            },
         )
         self.fastapi_request.app = SimpleNamespace(
             state=SimpleNamespace(qwen_exo_runtime=runtime)
         )
+        return runtime
+
+    def test_convert_to_internal_request_binds_qwen_exo_initial_gdn(self):
+        """Chat Completions must bind the same global initial GDN as Responses.
+
+        OpenCode-style clients only use Chat Completions; without this bind
+        their conversations silently started from a zero recurrent state.
+        """
+        selection = {
+            "schema": "qwen-exo-session-initial-gdn-v1",
+            "source_digest": "a" * 64,
+            "state_identity": "b" * 64,
+            "cache_namespace": "qwen-exo:v1:request_prefix:global-gdn",
+            "scope": "global",
+        }
+        self._qwen_exo_runtime(selection)
         with patch.object(self.chat, "_process_messages") as proc_mock:
             proc_mock.return_value = MessageProcessingResult(
                 "Test prompt",
@@ -186,44 +195,66 @@ class ServingChatTestCase(unittest.TestCase):
                 self.basic_req, self.fastapi_request
             )
 
-        assert adapted.input_ids == [91, 92, 1, 2, 3]
-        assert adapted.extra_key == "qwen-exo:v1:cognition-prefix"
-        assert adapted.sampling_params["custom_params"][
-            "qwen_exo_native_bank_selection"
-        ] == {
-            "source_digest": "c" * 64,
-            "page_id": 7,
-            "local_positions": [0, 1],
-            "prefix_identity": "cognition-prefix",
-        }
+        assert adapted.input_ids == [1, 2, 3]
+        assert adapted.extra_key == (
+            "qwen-exo:v1:request_prefix:global-gdn|qwen-exo-editor=none"
+        )
+        custom_params = adapted.sampling_params["custom_params"]
+        assert custom_params["qwen_exo_kind"] == "user"
+        assert custom_params["qwen_exo_session_initial_gdn"] == selection
 
-    def test_qwen_exo_cognition_prefix_converts_text_prompt(self):
-        selection = SimpleNamespace(
-            token_ids=(91, 92),
-            page_id=7,
-            prefix_identity="cognition-prefix",
-            source_digest="c" * 64,
-            local_positions=(0, 1),
-            radix_namespace="qwen-exo:v1:cognition-prefix",
-        )
-        runtime = SimpleNamespace(
-            memory_pipeline=SimpleNamespace(
-                tensor_bank=SimpleNamespace(
-                    cognition_selection=lambda: selection,
-                )
-            )
-        )
-        self.fastapi_request.app = SimpleNamespace(
-            state=SimpleNamespace(qwen_exo_runtime=runtime)
-        )
-        adapted = GenerateReqInput(text="Test prompt", sampling_params={})
+    def test_chat_prepends_personality_before_client_system_prompt(self):
+        """Chat Completions must carry the PolicyData personality like Responses.
 
-        adapted = self.chat._apply_qwen_exo_chat_native_prefix(
+        Responses attaches it through the memory pipeline's instructions;
+        Chat Completions has no instructions field and previously sent the
+        bare client messages, so the model answered "who are you" without
+        its configured identity. The card leads so a client system prompt
+        can still refine the task afterwards.
+        """
+        self._qwen_exo_runtime(None, personality="<policy_data>identity</policy_data>")
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "system", "content": "client system"},
+                {"role": "user", "content": "who are you?"},
+            ],
+        )
+
+        prepared = self.chat._prepend_qwen_exo_personality(
+            request, self.fastapi_request
+        )
+
+        assert [(m.role, m.content) for m in prepared.messages] == [
+            ("system", "<policy_data>identity</policy_data>"),
+            ("system", "client system"),
+            ("user", "who are you?"),
+        ]
+        assert [m.role for m in request.messages] == ["system", "user"]
+        untouched = self.chat._prepend_qwen_exo_personality(request, None)
+        assert untouched is request
+
+    def test_chat_without_initial_gdn_uses_isolated_cache_namespace(self):
+        """Requests served before the state is ready never share cached prefixes
+        with requests that later start from the initial GDN."""
+        self._qwen_exo_runtime(None)
+        adapted = GenerateReqInput(
+            text="Test prompt",
+            sampling_params={"custom_params": {"qwen_exo_session_initial_gdn": {}}},
+            extra_key="client-salt",
+        )
+
+        adapted = self.chat._apply_qwen_exo_chat_runtime_params(
             adapted, self.fastapi_request
         )
 
-        assert adapted.text is None
-        assert adapted.input_ids == [91, 92, 1, 2, 3, 4, 5]
+        assert adapted.extra_key == (
+            "qwen-exo:v1:global-initial-gdn:unavailable|client-salt"
+            "|qwen-exo-editor=none"
+        )
+        assert "qwen_exo_session_initial_gdn" not in (
+            adapted.sampling_params["custom_params"]
+        )
 
     def test_convert_to_internal_request_rejects_stream_return_prompt_token_ids(self):
         req = ChatCompletionRequest(

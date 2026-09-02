@@ -183,20 +183,13 @@ class CausalReplayService:
         branch_candidates: list[
             tuple[KnowledgeCandidate, EligibilityDecision] | None
         ] = [None]
-        branch_native_prefixes = [None]
         for candidate, decision in eligible:
-            native_prefix = candidate.native_prefix
-            if native_prefix is not None:
-                branch_ids.append(native_prefix.token_ids + causal_prefix + observation)
-                label_starts.append(len(native_prefix.token_ids) + len(causal_prefix))
-            else:
-                memory_ids = self._candidate_memory_ids(candidate)
-                if not memory_ids:
-                    continue
-                branch_ids.append(causal_prefix + memory_ids + observation)
-                label_starts.append(len(causal_prefix) + len(memory_ids))
+            memory_ids = self._candidate_memory_ids(candidate)
+            if not memory_ids:
+                continue
+            branch_ids.append(causal_prefix + memory_ids + observation)
+            label_starts.append(len(causal_prefix) + len(memory_ids))
             branch_candidates.append((candidate, decision))
-            branch_native_prefixes.append(native_prefix)
         if len(branch_ids) == 1:
             return self._completed(
                 self._rejected(
@@ -211,22 +204,6 @@ class CausalReplayService:
         shared_prefix_key = (
             "qwen-exo:v1:causal-replay:"
             + stable_digest(parent_request_id, event.event_id)[:24]
-        )
-        custom_params_per_job = tuple(
-            (
-                {"qwen_exo_native_bank_selection": native_prefix.scheduler_payload()}
-                if native_prefix is not None
-                else {}
-            )
-            for native_prefix in branch_native_prefixes
-        )
-        extra_keys = tuple(
-            (
-                native_prefix.radix_namespace
-                if native_prefix is not None
-                else shared_prefix_key
-            )
-            for native_prefix in branch_native_prefixes
         )
         jobs = tuple(
             InternalJob(
@@ -250,14 +227,6 @@ class CausalReplayService:
             )
             for index in range(len(branch_ids))
         )
-        runner_overrides = (
-            {
-                "custom_params_per_job": custom_params_per_job,
-                "extra_keys": extra_keys,
-            }
-            if any(item is not None for item in branch_native_prefixes)
-            else {}
-        )
         try:
             scores = await self.runner.run_score_batch(
                 jobs,
@@ -269,7 +238,6 @@ class CausalReplayService:
                     "top_k": 1,
                     "skip_special_tokens": True,
                 },
-                **runner_overrides,
             )
         except Exception as exc:
             self.telemetry.emit(

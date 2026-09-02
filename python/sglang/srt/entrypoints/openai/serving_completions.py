@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Uni
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
-
+from qwen_exo_booster.initial_gdn_request import bind_initial_gdn_request
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -53,6 +53,35 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
     def _request_id_prefix(self) -> str:
         return "cmpl-"
+
+    def _apply_qwen_exo_runtime_params(
+        self,
+        adapted_request: GenerateReqInput,
+        raw_request: Request | None,
+    ) -> GenerateReqInput:
+        """Attach the runtime-wide initial GDN to legacy completions."""
+        if raw_request is None:
+            return adapted_request
+        try:
+            runtime = raw_request.app.state.qwen_exo_runtime
+        except (AttributeError, RuntimeError):
+            return adapted_request
+        if runtime is None:
+            return adapted_request
+
+        sampling_params = adapted_request.sampling_params
+        if not isinstance(sampling_params, dict):
+            return adapted_request
+        custom_params, extra_key = bind_initial_gdn_request(
+            runtime,
+            custom_params=dict(sampling_params.get("custom_params") or {}),
+            extra_key=adapted_request.extra_key,
+        )
+        custom_params["qwen_exo_kind"] = "user"
+        sampling_params["custom_params"] = custom_params
+        adapted_request.sampling_params = sampling_params
+        adapted_request.extra_key = extra_key
+        return adapted_request
 
     def _validate_request(self, request: CompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
@@ -126,12 +155,17 @@ class OpenAIServingCompletion(OpenAIServingBase):
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
             session_id=request.session_id,
+            session_params=request.session_params,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
+        )
+
+        adapted_request = self._apply_qwen_exo_runtime_params(
+            adapted_request, raw_request
         )
 
         return adapted_request, request

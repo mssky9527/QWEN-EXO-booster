@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import json
+import math
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
@@ -1460,7 +1460,6 @@ class MemoryPipeline:
         retrieval_latency = time.perf_counter() - retrieval_started
         restored_answer = None
         restoration_active = False
-        restoration_knowledge_positions: dict[str, tuple[int, ...]] = {}
         selected_document_ids: tuple[str, ...] = ()
         selected_lanes: tuple[str, ...] = ()
         selected_reference_digests: tuple[str, ...] = ()
@@ -1501,375 +1500,84 @@ class MemoryPipeline:
                 and "policydata" not in selected_lanes
             ):
                 restored_answer = restoration.answer
-                source_positions = tuple(getattr(restoration, "source_positions", ()))
-                if len(selected_document_ids) == 1 and source_positions:
-                    restoration_knowledge_positions[selected_document_ids[0]] = (
-                        source_positions
-                    )
 
-        attractor_active = False
-        if (
-            not restoration_active
-            and previous is not None
-            and previous.next_attractor_status == "ready"
-            and previous.next_attractor_document_id is not None
-            and previous.next_attractor_reference_digest is not None
-            and previous.next_attractor_lane in {"knowledge", "policydata"}
-        ):
-            attractor_source = (
-                previous.next_attractor_lane,
-                previous.next_attractor_document_id,
-                previous.next_attractor_reference_digest,
-            )
-            attractor_active = attractor_source in {
-                (candidate.lane, candidate.document_id, candidate.reference_digest)
-                for candidate in eligible_candidates
-            }
-            if attractor_active:
-                selected_document_ids = (previous.next_attractor_document_id,)
-                selected_reference_digests = (previous.next_attractor_reference_digest,)
-                selected_lanes = (previous.next_attractor_lane,)
-        restored_page_ids = (
-            tuple(getattr(restoration, "candidate_page_ids", ()))
-            if restoration_active and restoration is not None
-            else (
-                (previous.next_attractor_page_id,)
-                if (
-                    attractor_active
-                    and previous is not None
-                    and previous.next_attractor_page_id is not None
-                )
-                else ()
-            )
-        )
-        bind_native_prefix = (
-            getattr(self.tensor_bank, "bind_native_prefix", None)
-            if self.tensor_bank is not None
-            else None
-        )
-        if eligible_candidates and callable(bind_native_prefix):
-            await self.tensor_bank.ensure_ready()
-            preferred_source = (
-                (
-                    selected_lanes[0],
-                    selected_document_ids[0],
-                )
-                if len(selected_lanes) == len(selected_document_ids) == 1
-                else None
-            )
-            bound_candidates = tuple(
-                bind_native_prefix(
-                    candidate,
-                    query=question,
-                    preferred_page_ids=(
-                        restored_page_ids
-                        if preferred_source == (candidate.lane, candidate.document_id)
-                        else ()
-                    ),
-                )
-                for candidate in eligible_candidates
-            )
-            bound_by_id = {
-                candidate.candidate_id: candidate for candidate in bound_candidates
-            }
-            candidate_tuple = tuple(
-                bound_by_id.get(candidate.candidate_id, candidate)
-                for candidate in candidate_tuple
-            )
-            eligible_candidates = bound_candidates
-            eligible_knowledge_candidates = tuple(
-                candidate
-                for candidate in eligible_candidates
-                if candidate.lane == "knowledge"
-            )
-
-        radix_prefix_token_ids: tuple[int, ...] = ()
-        radix_prefix_page_id: int | None = None
-        radix_prefix_identity: str | None = None
-        radix_prefix_namespace: str | None = None
-        radix_prefix_source_digest: str | None = None
-        radix_prefix_local_positions: tuple[int, ...] = ()
-        radix_prefix_lane: str | None = None
-        radix_prefix_selection_reason: str | None = None
-        native_candidates = tuple(
-            sorted(
-                (
-                    candidate
-                    for candidate in eligible_candidates
-                    if candidate.native_prefix is not None
-                    and (
-                        candidate.lane != "policydata"
-                        or len(candidate.native_prefix.token_ids)
-                        <= self.config.max_policy_tokens
-                    )
-                ),
-                key=lambda candidate: (
-                    -float(
-                        candidate.tensor_score
-                        if candidate.tensor_score is not None
-                        else candidate.score
-                    ),
-                    candidate.lane,
-                    candidate.document_id,
-                ),
-            )
-        )
-        native_candidate = next(
-            (
-                candidate
-                for candidate in native_candidates
-                if candidate.native_prefix.page_id in restored_page_ids
-                and (
-                    not selected_lanes
-                    or candidate.lane in selected_lanes
-                    and candidate.document_id in selected_document_ids
-                )
-            ),
-            None,
-        )
-        if native_candidate is None and not restored_page_ids:
-            native_candidate = next(iter(native_candidates), None)
-        if native_candidate is not None:
-            radix_prefix_selection_reason = (
-                "restored" if restored_page_ids else "query_qk"
-            )
-        native_selection = (
-            native_candidate.native_prefix if native_candidate is not None else None
-        )
-        if native_selection is not None:
-            radix_prefix_token_ids = native_selection.token_ids
-            radix_prefix_page_id = native_selection.page_id
-            radix_prefix_identity = native_selection.prefix_identity
-            radix_prefix_namespace = native_selection.radix_namespace
-            radix_prefix_source_digest = native_selection.source_digest
-            radix_prefix_local_positions = native_selection.local_positions
-            radix_prefix_lane = native_candidate.lane
-        elif restored_page_ids and self.tensor_bank is not None:
-            restored_selection = None
-            restored_lane = None
-            selection_for_page = getattr(self.tensor_bank, "selection_for_page", None)
-            page_lane = getattr(self.tensor_bank, "page_lane", None)
-            if callable(selection_for_page):
-                try:
-                    restored_selection = selection_for_page(restored_page_ids[0])
-                    if callable(page_lane):
-                        restored_lane = page_lane(restored_page_ids[0])
-                    elif len(set(selected_lanes)) == 1:
-                        restored_lane = selected_lanes[0]
-                except (KeyError, RuntimeError):
-                    restored_selection = None
-                    restored_lane = None
-            if (
-                restored_selection is not None
-                and restored_selection.document_id in selected_document_ids
-                and restored_lane in selected_lanes
-                and (
-                    restored_lane != "policydata"
-                    or len(restored_selection.token_ids)
-                    <= self.config.max_policy_tokens
-                )
-            ):
-                native_selection = restored_selection
-                native_candidate = next(
-                    (
-                        candidate
-                        for candidate in eligible_candidates
-                        if candidate.document_id == restored_selection.document_id
-                        and candidate.lane == restored_lane
-                    ),
-                    None,
-                )
-                radix_prefix_token_ids = restored_selection.token_ids
-                radix_prefix_page_id = restored_selection.page_id
-                radix_prefix_identity = restored_selection.prefix_identity
-                radix_prefix_namespace = restored_selection.radix_namespace
-                radix_prefix_source_digest = restored_selection.source_digest
-                radix_prefix_local_positions = restored_selection.local_positions
-                radix_prefix_lane = restored_lane
-                radix_prefix_selection_reason = "restored"
-            else:
-                try:
-                    page, prefix_ids = self.tensor_bank.page_prefix_token_ids(
-                        restored_page_ids[0]
-                    )
-                except (KeyError, RuntimeError):
-                    page = None
-                    prefix_ids = ()
-                if (
-                    page is not None
-                    and page.document_id in selected_document_ids
-                    and page.lane in selected_lanes
-                    and (
-                        page.lane != "policydata"
-                        or len(prefix_ids) <= self.config.max_policy_tokens
-                    )
-                ):
-                    native_candidate = next(
-                        (
-                            candidate
-                            for candidate in eligible_candidates
-                            if candidate.document_id == page.document_id
-                            and candidate.lane == page.lane
-                        ),
-                        None,
-                    )
-                    radix_prefix_token_ids = tuple(prefix_ids)
-                    radix_prefix_page_id = page.page_id
-                    radix_prefix_identity = page.prefix_identity
-                    radix_prefix_namespace = page.radix_namespace
-                    radix_prefix_lane = page.lane
-                    radix_prefix_selection_reason = "restored"
-        if native_selection is None and self.tensor_bank is not None:
-            personality_selection = getattr(
-                self.tensor_bank, "cognition_selection", None
-            )
-            try:
-                native_selection = (
-                    personality_selection() if callable(personality_selection) else None
-                )
-            except RuntimeError:
-                native_selection = None
-            if native_selection is not None:
-                page_lane = getattr(self.tensor_bank, "page_lane", None)
-                fallback_lane = (
-                    page_lane(native_selection.page_id)
-                    if callable(page_lane)
-                    else "cognition"
-                )
-                radix_prefix_token_ids = native_selection.token_ids
-                radix_prefix_page_id = native_selection.page_id
-                radix_prefix_identity = native_selection.prefix_identity
-                radix_prefix_namespace = native_selection.radix_namespace
-                radix_prefix_source_digest = native_selection.source_digest
-                radix_prefix_local_positions = native_selection.local_positions
-                radix_prefix_lane = fallback_lane
-                radix_prefix_selection_reason = f"{fallback_lane}_always_on"
-        selected_native_candidates = (
-            (native_candidate,) if native_candidate is not None else ()
-        )
         eligible_knowledge_candidates = tuple(
             candidate
-            for candidate in selected_native_candidates
+            for candidate in eligible_candidates
             if candidate.lane == "knowledge"
         )
+        if restoration_active:
+            restored_knowledge_sources = {
+                (document_id, reference_digest)
+                for lane, document_id, reference_digest in zip(
+                    selected_lanes,
+                    selected_document_ids,
+                    selected_reference_digests,
+                )
+                if lane == "knowledge"
+            }
+            restored_candidates = tuple(
+                candidate
+                for candidate in eligible_knowledge_candidates
+                if (candidate.document_id, candidate.reference_digest)
+                in restored_knowledge_sources
+            )
+            if restored_candidates:
+                eligible_knowledge_candidates = restored_candidates
+
         original_instructions = getattr(request, "instructions", None)
         original_extra_key = getattr(request, "extra_key", None)
-        native_policy_candidate = None
-        if (
-            native_candidate is not None
-            and native_candidate.lane == "policydata"
-            and native_selection is not None
-        ):
-            native_policy_candidate = replace(
-                native_candidate,
-                page_ids=(native_selection.page_id,),
-                source_positions=native_selection.source_positions,
-                virtual_positions=tuple(range(len(native_selection.source_positions))),
-                native_prefix=native_selection,
-            )
         policy = (
-            self.policy_data.compile_native_candidate(
-                native_policy_candidate,
+            self.policy_data.compile_text_attachment(
+                self.tokenizer,
                 max_tokens=self.config.max_policy_tokens,
             )
             if self.policy_data is not None and self.config.feature_flags.policy_data
             else None
         )
         policy_active = policy is not None and policy.active
-        policy_instructions = original_instructions
-        policy_cache_namespace = (
-            radix_prefix_namespace if policy_active else original_extra_key
-        )
+        policy_parts = [str(original_instructions or "").strip()]
+        if policy_active and policy is not None and policy.instructions:
+            policy_parts.append(policy.instructions)
+        policy_instructions = "\n\n".join(part for part in policy_parts if part) or None
 
-        if self.tensor_bank is not None:
-            attachment_candidates = ()
-            private_instruction, attached_tokens = None, 0
-        else:
-            attachment_candidates = eligible_knowledge_candidates
-            private_instruction, attached_tokens = self._compile_attachment(
-                attachment_candidates,
-                restored_answer=restored_answer,
-                restored_positions_by_document=restoration_knowledge_positions,
-                max_tokens=self.config.max_memory_tokens,
-            )
+        attachment_candidates = eligible_knowledge_candidates
+        private_instruction, attached_tokens = self._compile_attachment(
+            attachment_candidates,
+            restored_answer=restored_answer,
+            max_tokens=self.config.max_memory_tokens,
+        )
+        attachment_digest = None
         if private_instruction:
             attachment_digest = stable_digest(
                 self.repository.snapshot.source_digest,
                 *(candidate.reference_digest for candidate in attachment_candidates),
                 stable_digest(restored_answer) if restored_answer else "",
-                *(
-                    str(position)
-                    for positions in restoration_knowledge_positions.values()
-                    for position in positions
-                ),
             )
+
+        instruction_parts = [str(policy_instructions or "").strip()]
+        if private_instruction:
+            instruction_parts.append(private_instruction)
+        instructions = "\n\n".join(part for part in instruction_parts if part) or None
+        if policy_active or private_instruction:
             cache_namespace = HybridRuntimePolicy.namespace_key(
                 HybridStateNamespace.EXTERNAL_MEMORY,
                 stable_digest(
                     policy.attachment_digest if policy is not None else "",
-                    attachment_digest,
+                    attachment_digest or "",
                     original_extra_key or "",
                 ),
-            )
-            prepared_instructions = str(policy_instructions or "").strip()
-            instructions = (
-                f"{prepared_instructions}\n\n{private_instruction}"
-                if prepared_instructions
-                else private_instruction
             )
             prepared_request = request.model_copy(
                 update={"instructions": instructions, "extra_key": cache_namespace}
             )
         else:
-            attachment_digest = None
-            cache_namespace = policy_cache_namespace
+            cache_namespace = original_extra_key
             prepared_request = request
-
-        if radix_prefix_namespace:
-            cache_namespace = radix_prefix_namespace
-            prepared_request = prepared_request.model_copy(
-                update={"extra_key": radix_prefix_namespace}
-            )
-
-        position_candidates = (
-            *eligible_knowledge_candidates,
-            *(
-                (native_policy_candidate,)
-                if native_policy_candidate is not None
-                else ()
-            ),
+        policy_cache_namespace = (
+            cache_namespace if policy_active else original_extra_key
         )
-        position_map = [
-            (
-                candidate.lane,
-                candidate.document_id,
-                source_position,
-                virtual_position,
-            )
-            for candidate in position_candidates
-            for source_position, virtual_position in zip(
-                candidate.source_positions, candidate.virtual_positions
-            )
-        ]
-        if restoration_active and restoration is not None:
-            restored_positions = tuple(getattr(restoration, "source_positions", ()))
-            restored_documents = tuple(
-                getattr(restoration, "selected_document_ids", ())
-            )
-            restored_lanes = tuple(getattr(restoration, "selected_lanes", ()))
-            if not restored_lanes:
-                restored_lanes = ("knowledge",) * len(restored_documents)
-            if len(restored_documents) == len(restored_lanes) == 1:
-                position_map.extend(
-                    (
-                        restored_lanes[0],
-                        restored_documents[0],
-                        source_position,
-                        virtual_slot,
-                    )
-                    for virtual_slot, source_position in enumerate(restored_positions)
-                )
-        position_map = list(dict.fromkeys(position_map))
+
         has_cognition_document = bool(
             self.tensor_bank is not None
             and any(
@@ -1878,6 +1586,11 @@ class MemoryPipeline:
                     getattr(self.tensor_bank, "snapshot", None), "pages", ()
                 )
             )
+        )
+        cognition_source_tokens = (
+            len(getattr(self.tensor_bank, "cognition_token_ids", lambda: ())())
+            if has_cognition_document and self.tensor_bank is not None
+            else 0
         )
 
         state = MemoryPreparationState(
@@ -1950,154 +1663,64 @@ class MemoryPipeline:
                 "restored"
                 if restoration_active
                 else (
-                    "attractor_restored"
-                    if attractor_active
-                    else (
-                        "rejected_or_unavailable"
-                        if restoration is not None
-                        else "not_requested"
-                    )
+                    "rejected_or_unavailable"
+                    if restoration is not None
+                    else "not_requested"
                 )
             ),
             restoration_document_ids=(
-                tuple(restoration.selected_document_ids)
-                if restoration_active and restoration is not None
-                else (selected_document_ids if attractor_active else ())
+                tuple(selected_document_ids) if restoration_active else ()
             ),
-            restoration_page_ids=(
-                restored_page_ids if restoration_active or attractor_active else ()
-            ),
+            restoration_page_ids=(),
             restoration_source_positions=(
                 tuple(getattr(restoration, "source_positions", ()))
                 if restoration_active and restoration is not None
-                else (
-                    previous.next_attractor_source_positions
-                    if attractor_active and previous is not None
-                    else ()
-                )
+                else ()
             ),
             restoration_decision_id=(
                 getattr(restoration, "replay_winner_decision_id", None)
                 if restoration_active and restoration is not None
-                else (
-                    previous.next_attractor_decision_id
-                    if attractor_active and previous is not None
-                    else None
-                )
-            ),
-            hybrid_restoration_mode=(
-                (
-                    "native_policy_full_attention_kv_and_gdn_state"
-                    if radix_prefix_lane == "policydata"
-                    else "native_radix_full_attention_kv_and_gdn_state"
-                )
-                if radix_prefix_token_ids
-                else "none"
-            ),
-            section_delta_mode=(
-                "complete_document_gdn_state_plus_salient_raw_kv"
-                if native_selection is not None
-                else (
-                    "complete_compiled_prefix_state_no_arbitrary_delta_mix"
-                    if radix_prefix_token_ids
-                    else "none"
-                )
-            ),
-            memory_position_map=tuple(position_map),
-            radix_prefix_token_ids=radix_prefix_token_ids,
-            radix_prefix_page_id=radix_prefix_page_id,
-            radix_prefix_identity=radix_prefix_identity,
-            radix_prefix_namespace=radix_prefix_namespace,
-            radix_prefix_source_digest=radix_prefix_source_digest,
-            radix_prefix_local_positions=radix_prefix_local_positions,
-            radix_prefix_lane=radix_prefix_lane,
-            radix_prefix_selection_reason=radix_prefix_selection_reason,
-            cognition_active=(
-                has_cognition_document
-                and native_selection is not None
-                and radix_prefix_lane == "cognition"
-            ),
-            cognition_conditioned=(
-                has_cognition_document
-                and native_selection is not None
-                and radix_prefix_lane != "cognition"
-            ),
-            cognition_page_id=(
-                radix_prefix_page_id
-                if has_cognition_document
-                and native_selection is not None
-                and radix_prefix_lane == "cognition"
                 else None
             ),
-            cognition_source_tokens=(
-                len(getattr(self.tensor_bank, "cognition_token_ids", lambda: ())())
-                if has_cognition_document and self.tensor_bank is not None
-                else 0
+            hybrid_restoration_mode=(
+                "text_reference_context" if restoration_active else "none"
             ),
+            section_delta_mode="none",
+            memory_position_map=(),
+            radix_prefix_token_ids=(),
+            radix_prefix_page_id=None,
+            radix_prefix_identity=None,
+            radix_prefix_namespace=None,
+            radix_prefix_source_digest=None,
+            radix_prefix_local_positions=(),
+            radix_prefix_lane=None,
+            radix_prefix_selection_reason=None,
+            cognition_active=has_cognition_document,
+            cognition_conditioned=False,
+            cognition_page_id=None,
+            cognition_source_tokens=cognition_source_tokens,
         )
         await self._store_state(state)
         return prepared_request, state
 
-    async def capture_native_attractor(
+    async def finalize_request_state(
         self, request_id: str
     ) -> MemoryPreparationState | None:
         state = await self.get_state(request_id)
         if state is None:
             return None
-        status = "unavailable"
-        winner = None
-        winner_decision = None
-        decision_by_candidate = {
-            decision.candidate_id: decision
-            for decision in state.decisions
-            if decision.status is EligibilityStatus.ELIGIBLE
-            and decision.parent_request_id == request_id
-        }
-        native_candidates = tuple(
-            candidate
-            for candidate in state.candidates
-            if candidate.native_prefix is not None
-            and candidate.candidate_id in decision_by_candidate
-        )
-        if native_candidates:
-            winner = min(
-                native_candidates,
-                key=lambda candidate: (
-                    -self._raw_tensor_score(candidate),
-                    candidate.lane,
-                    candidate.document_id,
-                ),
-            )
-            winner_decision = decision_by_candidate[winner.candidate_id]
-            status = "ready"
-        else:
-            status = "no_admitted_match"
         updated = replace(
             state,
             query_heads=(),
-            next_attractor_status=status,
-            next_attractor_candidate_id=(
-                winner.candidate_id if winner is not None else None
-            ),
-            next_attractor_document_id=(
-                winner.document_id if winner is not None else None
-            ),
-            next_attractor_reference_digest=(
-                winner.reference_digest if winner is not None else None
-            ),
-            next_attractor_lane=(winner.lane if winner is not None else None),
-            next_attractor_page_id=(
-                winner.native_prefix.page_id if winner is not None else None
-            ),
-            next_attractor_source_positions=(
-                winner.native_prefix.source_positions if winner is not None else ()
-            ),
-            next_attractor_tensor_score=(
-                winner.tensor_score if winner is not None else None
-            ),
-            next_attractor_decision_id=(
-                winner_decision.decision_id if winner_decision is not None else None
-            ),
+            next_attractor_status="disabled_global_initial_only",
+            next_attractor_candidate_id=None,
+            next_attractor_document_id=None,
+            next_attractor_reference_digest=None,
+            next_attractor_lane=None,
+            next_attractor_page_id=None,
+            next_attractor_source_positions=(),
+            next_attractor_tensor_score=None,
+            next_attractor_decision_id=None,
         )
         await self._store_state(updated)
         return updated

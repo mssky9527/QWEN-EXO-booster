@@ -151,6 +151,39 @@ def test_structured_internal_generation_remains_target_only():
     assert "qwen_exo_dflash" not in custom
 
 
+def test_explicit_target_only_overrides_dflash_eligible_job_type():
+    manager = FakeTokenizerManager(
+        outputs=[{"text": "reflection", "meta_info": {"completion_tokens": 4}}]
+    )
+    runner = InternalJobRunner(
+        manager,
+        max_fanout=1,
+        max_tokens_per_parent=128,
+        request_factory=request_factory,
+    )
+
+    asyncio.run(
+        runner.run_batch(
+            [
+                job(
+                    job_type=InternalJobType.REFLECTION_MEMORY,
+                    token_budget=96,
+                    deadline_monotonic=None,
+                    max_fanout=1,
+                )
+            ],
+            ["capture a flushed target recurrent state"],
+            {
+                "temperature": 0,
+                "custom_params": {"qwen_exo_dflash": "target_only"},
+            },
+        )
+    )
+
+    custom = manager.requests[0].sampling_params[0]["custom_params"]
+    assert custom["qwen_exo_dflash"] == "target_only"
+
+
 def test_reflection_job_without_deadline_reaches_scheduler():
     manager = FakeTokenizerManager(
         outputs=[{"text": "ok", "meta_info": {"completion_tokens": 1}}]

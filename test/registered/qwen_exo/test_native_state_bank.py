@@ -1,5 +1,4 @@
 import asyncio
-
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,8 +15,8 @@ from qwen_exo_booster.native_state_bank import (
     _page_path,
     _quantize_fp8,
 )
-from qwen_exo_booster.tensor_bank import TensorBank, TensorBankCompileError
 from qwen_exo_booster.query_probe import QueryStateSpan
+from qwen_exo_booster.tensor_bank import TensorBank, TensorBankCompileError
 
 
 def test_native_bank_reads_unified_radix_mamba_component():
@@ -171,6 +170,163 @@ def test_native_bank_exports_raw_kv_and_complete_section_delta(tmp_path):
     assert stored_temporal.shape == temporal.shape
     assert torch.allclose(stored_conv, conv.float(), atol=0.13, rtol=0.08)
     assert torch.allclose(stored_temporal, temporal.float(), atol=0.13, rtol=0.08)
+
+
+class _SessionMambaPool:
+    def __init__(self):
+        self.mamba_cache = SimpleNamespace(
+            conv=[torch.zeros(1, 4, 2, 2, dtype=torch.bfloat16)],
+            temporal=torch.zeros(1, 4, 1, 2, 2, dtype=torch.bfloat16),
+        )
+        self.replayssm_write_pos = None
+        self.replayssm_cache_base = None
+
+    def get_cpu_copy(self, indices):
+        indices = indices.to(dtype=torch.long)
+        return (
+            [self.mamba_cache.conv[0][:, indices].cpu().clone()],
+            self.mamba_cache.temporal[:, indices].cpu().clone(),
+        )
+
+    def load_cpu_copy(self, state, indices):
+        indices = indices.to(dtype=torch.long)
+        conv, temporal = state[:2]
+        self.mamba_cache.conv[0][:, indices] = conv[0]
+        self.mamba_cache.temporal[:, indices] = temporal
+
+
+class _SessionMambaAllocator:
+    def __init__(self):
+        self.allocations = 0
+
+    def alloc(self, count):
+        assert count == 1
+        self.allocations += 1
+        return torch.tensor([1 + self.allocations], dtype=torch.int32)
+
+    def free(self, _indices):
+        return None
+
+
+def test_session_initial_gdn_refresh_keeps_previous_identity_bindable(tmp_path):
+    """A refreshed identity must not reject requests queued under the old one.
+
+    The scheduler prepares the source slot when a request arrives and binds it
+    when the request is scheduled. With a single reserved slot, a newer
+    identity arriving in between overwrote the slot and the older request was
+    rejected at bind time. The bank keeps the previous identity resident and
+    only recycles the least recently used slot for a third identity.
+    """
+    mamba_pool = _SessionMambaPool()
+    allocator = _SessionMambaAllocator()
+    req_pool = SimpleNamespace(
+        mamba_pool=mamba_pool,
+        mamba_allocator=allocator,
+        translate_mamba_indices=lambda indices: indices,
+    )
+    text_config = SimpleNamespace(
+        layers_block_type=["attention"],
+        model_type="qwen3_5_text",
+        num_hidden_layers=1,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+    )
+    model_config = SimpleNamespace(model_path="", hf_text_config=text_config)
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            language_model=SimpleNamespace(layers=[SimpleNamespace()])
+        )
+    )
+    manager = NativeStateBankManager(
+        root=tmp_path,
+        model_config=model_config,
+        model=model,
+        kv_pool=object(),
+        kv_allocator=object(),
+        req_pool=req_pool,
+        tree_cache=SimpleNamespace(evict=lambda _params: None),
+        rank=0,
+        world_size=1,
+        page_size=64,
+        consensus=lambda value: value,
+    )
+
+    def export(identity, value):
+        mamba_pool.mamba_cache.conv[0][:, 1].fill_(value)
+        mamba_pool.mamba_cache.temporal[:, 1].fill_(value)
+        request = SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                custom_params={
+                    "qwen_exo_session_initial_gdn_export": {
+                        "source_digest": identity[0],
+                        "state_identity": identity[1],
+                    }
+                }
+            ),
+            mamba_pool_idx=torch.tensor(1),
+            origin_input_ids=[1, 2, 3],
+            output_ids_through_stop=[4, 5],
+        )
+        assert manager.maybe_export(request) is True
+        assert request.qwen_exo_session_initial_gdn_status == "exported"
+
+    def selection(identity):
+        return SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                custom_params={
+                    "qwen_exo_session_initial_gdn": {
+                        "source_digest": identity[0],
+                        "state_identity": identity[1],
+                        "cache_namespace": "session-cache",
+                    }
+                }
+            ),
+            extra_key="session-cache|qwen-exo-editor=none",
+            prefix_indices=(),
+            mamba_cow_src_index=None,
+            mamba_needs_clear=True,
+        )
+
+    first_identity = ("a" * 64, "b" * 64)
+    export(first_identity, 3)
+    queued_request = selection(first_identity)
+    assert manager.ensure_session_initial_gdn_source(queued_request) is True
+    assert manager.reserved_mamba_slots() == 1
+
+    # A refreshed identity arrives before the queued request is scheduled.
+    second_identity = ("c" * 64, "d" * 64)
+    export(second_identity, 7)
+    second_request = selection(second_identity)
+    assert manager.ensure_session_initial_gdn_source(second_request) is True
+    assert manager.reserved_mamba_slots() == 2
+
+    assert manager.bind_session_initial_gdn(queued_request) is True
+    assert tuple(queued_request.mamba_cow_src_index.tolist()) == (2,)
+    assert queued_request.mamba_needs_clear is False
+    assert torch.all(mamba_pool.mamba_cache.temporal[:, 2] == 3)
+    assert manager.bind_session_initial_gdn(second_request) is True
+    assert tuple(second_request.mamba_cow_src_index.tolist()) == (3,)
+    assert torch.all(mamba_pool.mamba_cache.temporal[:, 3] == 7)
+    assert allocator.allocations == 2
+
+    # A third identity recycles the least recently used slot (the first one)
+    # instead of growing the reserve; the evicted identity reloads on demand.
+    third_identity = ("e" * 64, "f" * 64)
+    export(third_identity, 9)
+    third_request = selection(third_identity)
+    assert manager.bind_session_initial_gdn(third_request) is True
+    assert tuple(third_request.mamba_cow_src_index.tolist()) == (2,)
+    assert torch.all(mamba_pool.mamba_cache.temporal[:, 2] == 9)
+    assert allocator.allocations == 2
+    assert manager.reserved_mamba_slots() == 2
+
+    revived_request = selection(first_identity)
+    assert manager.bind_session_initial_gdn(revived_request) is True
+    assert tuple(revived_request.mamba_cow_src_index.tolist()) == (3,)
+    assert torch.all(mamba_pool.mamba_cache.temporal[:, 3] == 3)
+    assert manager.stats()["session_gdn_loads"] == 4
+    assert manager.stats()["session_gdn_binds"] == 4
 
 
 def test_rope_rebases_raw_bank_keys_to_virtual_positions():

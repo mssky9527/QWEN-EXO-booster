@@ -1,7 +1,8 @@
+# isort: skip_file
 import unittest
 
-from utils import make_serving  # noqa: F401 — bootstrap import
-
+# Import the CPU bootstrap before SGLang; it installs Windows test stubs.
+from utils import make_serving  # noqa: F401
 from sglang.srt.entrypoints.openai.protocol import ResponsesRequest, UsageInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -151,6 +152,28 @@ class ResponsesResponseFromRequestTestCase(unittest.TestCase):
             usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
         )
         self.assertFalse(response.parallel_tool_calls)
+
+    def test_native_xhigh_serializes_as_openai_high(self):
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        for effort in ("xhigh", "max"):
+            with self.subTest(effort=effort):
+                request = ResponsesRequest(
+                    model="x",
+                    input="hi",
+                    reasoning={"effort": effort},
+                    store=False,
+                )
+                response = ResponsesResponse.from_request(
+                    request,
+                    sampling_params={},
+                    model_name="x",
+                    created_time=0,
+                    output=[],
+                    status="in_progress",
+                    usage=None,
+                )
+                self.assertEqual(response.reasoning["effort"], "high")
 
 
 if __name__ == "__main__":

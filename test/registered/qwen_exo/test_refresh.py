@@ -19,9 +19,9 @@ from qwen_exo_booster.knowledge import (
 from qwen_exo_booster.observer import MidThinkEvent
 from qwen_exo_booster.pipeline import MemoryPipeline
 from qwen_exo_booster.policy_data import PolicyDataRepository
+from qwen_exo_booster.query_probe import QueryStateSpan
 from qwen_exo_booster.refresh import SelfAskRefreshService
 from qwen_exo_booster.telemetry import TelemetryStore
-from qwen_exo_booster.query_probe import QueryStateSpan
 
 
 class FakeManager:
@@ -918,7 +918,7 @@ async def test_not_covered_answer_is_not_committed_as_think_context(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_refresh_binds_and_residents_qk_native_state_only_after_judge(tmp_path):
+async def test_refresh_keeps_judge_admitted_qk_candidate_text_only(tmp_path):
     manager = FakeManager(all_supported=True)
     bank = JudgeGatedBindingTensorBank(manager)
     service, repo = build_service(tmp_path, manager, tensor_bank=bank)
@@ -946,13 +946,11 @@ async def test_refresh_binds_and_residents_qk_native_state_only_after_judge(tmp_
     )
 
     assert record.status == "semantic_ready"
-    assert bank.bind_calls == [
-        (candidate.candidate_id, "What is the required WFP AppID?")
-    ]
-    assert bank.resident_page_ids == (7,)
+    assert bank.bind_calls == []
+    assert bank.resident_page_ids is None
     (eligible,) = service.eligible_candidates("request-judge-gated")
-    assert eligible.native_prefix is not None
-    assert eligible.candidate_origin == "admitted_native_tensor_bank"
+    assert eligible.native_prefix is None
+    assert eligible.candidate_origin == "attention_q_native_tensor_bank"
 
 
 @pytest.mark.asyncio

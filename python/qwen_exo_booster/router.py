@@ -114,6 +114,10 @@ class ApiKeyCreateRequest(BaseModel):
     label: str = Field(min_length=1, max_length=80)
 
 
+class ApiKeyDeleteRequest(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=1000)
+
+
 def _api_key_store() -> ApiKeyStore:
     path = Path(os.getenv("QWEN_EXO_API_KEY_STORE", "/data/qwen-exo/api-keys.json"))
     return ApiKeyStore(path)
@@ -171,6 +175,18 @@ async def create_api_key(payload: ApiKeyCreateRequest):
         return await asyncio.to_thread(_api_key_store().create, payload.label)
     except ApiKeyStoreError as exc:
         return JSONResponse(status_code=422, content={"detail": exc.public_dict()})
+
+
+@router.post("/api-keys/delete")
+async def delete_api_keys(payload: ApiKeyDeleteRequest):
+    """Permanently remove one or many keys (revoked or active)."""
+    try:
+        return await asyncio.to_thread(_api_key_store().delete, payload.ids)
+    except ApiKeyStoreError as exc:
+        status_code = 404 if exc.code == "key_not_found" else 422
+        return JSONResponse(
+            status_code=status_code, content={"detail": exc.public_dict()}
+        )
 
 
 @router.delete("/api-keys/{key_id}")

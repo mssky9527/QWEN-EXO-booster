@@ -736,32 +736,6 @@ class SelfAskRefreshService:
                     judged_references,
                     task_scope_filtered_key_set,
                 )
-                if self.tensor_bank is not None and eligible_judged:
-                    bind_native_prefix = getattr(
-                        self.tensor_bank, "bind_native_prefix", None
-                    )
-                    if callable(bind_native_prefix):
-                        eligible_judged = tuple(
-                            (
-                                bind_native_prefix(
-                                    candidate,
-                                    query=self_question,
-                                    preferred_page_ids=candidate.page_ids,
-                                )
-                                if candidate.candidate_origin
-                                == "attention_q_native_tensor_bank"
-                                else candidate
-                            )
-                            for candidate in eligible_judged
-                        )
-                        resident_page_ids = tuple(
-                            page_id
-                            for candidate in eligible_judged
-                            if candidate.native_prefix is not None
-                            for page_id in candidate.page_ids
-                        )
-                        if resident_page_ids:
-                            await self.tensor_bank.ensure_resident(resident_page_ids)
                 eligible_candidates = (
                     *direct_candidates,
                     *bypassed_knowledge_candidates,

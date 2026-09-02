@@ -1856,6 +1856,11 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_reserved_mamba_slots=lambda: (
+                self.qwen_exo_native_state_bank.reserved_mamba_slots()
+                if self.qwen_exo_native_state_bank is not None
+                else 0
+            ),
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -2596,6 +2601,18 @@ class Scheduler(
 
         try:
             self._ensure_qwen_exo_hybrid_state(req)
+            session_selection = custom_params.get("qwen_exo_session_initial_gdn")
+            if isinstance(session_selection, dict):
+                ensure_session_source = getattr(
+                    self.qwen_exo_native_state_bank,
+                    "ensure_session_initial_gdn_source",
+                    None,
+                )
+                if not callable(ensure_session_source):
+                    raise RuntimeError(
+                        "session-initial GDN is unsupported by this scheduler backend"
+                    )
+                ensure_session_source(req)
         except Exception as exc:
             self._reject_qwen_exo_request(
                 req,
@@ -2615,11 +2632,6 @@ class Scheduler(
             needs_mamba=mamba_allocator is not None,
             request_slots=0 if is_internal else 1,
             workspace_bytes=self._qwen_exo_workspace_estimate_bytes(req),
-            additional_mamba_slots=(
-                1
-                if isinstance(custom_params.get("qwen_exo_native_bank_selection"), dict)
-                else 0
-            ),
         )
         tree_cache = getattr(self, "tree_cache", None)
         evictable_kv_tokens = (
@@ -3884,16 +3896,16 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            try:
-                if self.qwen_exo_native_state_bank is not None:
-                    self.qwen_exo_native_state_bank.ensure_prefix(req)
-            except RuntimeError as exc:
-                self._reject_qwen_exo_cached_reuse(req, exc)
-                rejected_qwen_reqs.append(req)
-                continue
             req.init_next_round_input(self.tree_cache)
             try:
                 self._validate_qwen_exo_cached_reuse(req)
+                bind_session_gdn = getattr(
+                    self.qwen_exo_native_state_bank,
+                    "bind_session_initial_gdn",
+                    None,
+                )
+                if callable(bind_session_gdn):
+                    bind_session_gdn(req)
             except (ContractViolation, RuntimeError) as exc:
                 self._reject_qwen_exo_cached_reuse(req, exc)
                 rejected_qwen_reqs.append(req)

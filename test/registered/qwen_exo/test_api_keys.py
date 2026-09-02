@@ -56,6 +56,34 @@ def test_multiple_keys_and_idempotent_revoke(tmp_path):
     assert all("token" not in record and "digest" not in record for record in listing["keys"])
 
 
+def test_delete_removes_records_and_access_in_one_batch(tmp_path):
+    """Deletion drops the record and the token together for every listed id.
+
+    ``revoke`` keeps records forever, so the registry only grew. Deleting an
+    active key must not leave a valid digest behind, unknown ids are reported
+    rather than failing the whole batch, and an all-unknown batch is a 404.
+    """
+    store = ApiKeyStore(tmp_path / "api-keys.json")
+    active = store.create("active")
+    stale = store.create("stale")
+    keep = store.create("keep")
+    store.revoke(stale["id"])
+
+    result = store.delete([active["id"], stale["id"], "qxk_missing", active["id"]])
+
+    assert [record["id"] for record in result["deleted"]] == [
+        active["id"],
+        stale["id"],
+    ]
+    assert result["missing"] == ["qxk_missing"]
+    assert not store.validate_token(active["token"])
+    assert store.validate_token(keep["token"])
+    assert [record["id"] for record in store.listing()["keys"]] == [keep["id"]]
+    with pytest.raises(ApiKeyStoreError) as excinfo:
+        store.delete(["qxk_missing"])
+    assert excinfo.value.code == "key_not_found"
+
+
 def test_corrupt_registry_fails_closed(tmp_path):
     path = tmp_path / "api-keys.json"
     path.write_text('{"schema":1,"revision":"wrong","keys":[]}', encoding="utf-8")

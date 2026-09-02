@@ -58,15 +58,12 @@ class _NativeRunner:
         input_ids,
         label_starts,
         sampling_params,
-        *,
-        custom_params_per_job,
-        extra_keys,
+        **kwargs,
     ):
         self.call = (
             tuple(tuple(item) for item in input_ids),
             tuple(label_starts),
-            tuple(custom_params_per_job),
-            tuple(extra_keys),
+            dict(kwargs),
         )
         return await _SuccessfulRunner().run_score_batch(
             jobs, input_ids, label_starts, sampling_params
@@ -274,7 +271,7 @@ async def test_score_exception_emits_one_failed_closed_completed_event(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_native_replay_loads_bank_prefix_instead_of_reprefilling_reference(
+async def test_replay_uses_bounded_reference_text_even_if_candidate_has_native_state(
     tmp_path,
 ):
     request_id = "request-native"
@@ -306,11 +303,9 @@ async def test_native_replay_loads_bank_prefix_instead_of_reprefilling_reference
     )
 
     assert result.decision == "shadow_would_switch"
-    branch_ids, label_starts, custom_params, extra_keys = runner.call
-    assert branch_ids[1][:64] == native.token_ids
-    assert label_starts[1] == 64 + 5
-    assert custom_params[0] == {}
-    assert custom_params[1] == {
-        "qwen_exo_native_bank_selection": native.scheduler_payload()
-    }
-    assert extra_keys[1] == native.radix_namespace
+    branch_ids, label_starts, kwargs = runner.call
+    memory_ids = service._candidate_memory_ids(candidate)
+    assert branch_ids[1][5 : 5 + len(memory_ids)] == memory_ids
+    assert branch_ids[1][:64] != native.token_ids
+    assert label_starts[1] == 5 + len(memory_ids)
+    assert kwargs == {}

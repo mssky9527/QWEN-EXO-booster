@@ -1,11 +1,11 @@
 from __future__ import annotations
+
 import asyncio
 import json
 from dataclasses import replace
 
 import pytest
 from qwen_exo_booster.internal_jobs import InternalJobResult
-
 from qwen_exo_booster.knowledge import KnowledgeRepository, retrieval_diversity_bucket
 from qwen_exo_booster.reflection_memory import (
     REFLECTION_MEMORY_TOOL_NAME,
@@ -636,6 +636,11 @@ def test_reflection_generation_updates_retrieved_memory_instead_of_inserting(tmp
         }
 
     store = ReflectionMemoryStore(tmp_path / "reflection-memory.json")
+    stored_callbacks = []
+
+    async def on_memory_stored(reflection):
+        stored_callbacks.append((reflection.source_digest, len(store.list())))
+
     service = ReflectionMemoryService(
         runner,
         _CharacterTokenizer(),
@@ -646,6 +651,7 @@ def test_reflection_generation_updates_retrieved_memory_instead_of_inserting(tmp
         store=store,
         publish=publish,
         retrieve_similar=retrieve,
+        on_memory_stored=on_memory_stored,
     )
 
     result = asyncio.run(
@@ -682,6 +688,7 @@ def test_reflection_generation_updates_retrieved_memory_instead_of_inserting(tmp
     assert published[0].target_document_sha256 == candidate.document_sha256
     assert published[0].document_path is None
     assert len(store.list()) == 1
+    assert stored_callbacks == [(result.source_digest, 1)]
 
 
 def test_reflection_markdown_uses_stable_task_category(tmp_path):

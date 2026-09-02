@@ -11,7 +11,6 @@ from qwen_exo_booster.knowledge import (
     KnowledgeDocument,
     KnowledgeRepository,
     KnowledgeSnapshot,
-    NativePrefixSelection,
 )
 
 NON_REFERENCE_POLICY_SOURCE_KINDS = frozenset({"coding_agent_execution_policy"})
@@ -19,21 +18,20 @@ NON_REFERENCE_POLICY_SOURCE_KINDS = frozenset({"coding_agent_execution_policy"})
 
 @dataclass(frozen=True, slots=True)
 class PolicyDataAttachment:
-    """One semantically admitted PolicyData page bound to native model state."""
+    """The canonical PolicyData document rendered as trusted instructions."""
 
     source_digest: str
     attachment_digest: str | None
     document_ids: tuple[str, ...]
     document_digests: tuple[str, ...]
     attached_tokens: int
-    native_prefix: NativePrefixSelection | None = field(repr=False)
+    instructions: str | None = field(repr=False)
 
     @property
     def active(self) -> bool:
-        return self.native_prefix is not None
+        return bool(self.instructions)
 
     def public_dict(self) -> dict[str, Any]:
-        native_prefix = self.native_prefix
         return {
             "source_digest": self.source_digest,
             "attachment_digest": self.attachment_digest,
@@ -45,22 +43,9 @@ class PolicyDataAttachment:
             "semantic_eligibility_required": False,
             "qk_relevance_required": False,
             "reference_judge_required": False,
-            "injection_mode": (
-                "native_full_attention_salient_kv_and_gdn_document_state"
-                if native_prefix is not None
-                else "none"
-            ),
-            "text_attached": False,
-            "native_state": (
-                {
-                    "source_digest": native_prefix.source_digest,
-                    "page_id": native_prefix.page_id,
-                    "prefix_identity": native_prefix.prefix_identity,
-                    "tokens": len(native_prefix.token_ids),
-                }
-                if native_prefix is not None
-                else None
-            ),
+            "injection_mode": "text_instructions" if self.active else "none",
+            "text_attached": self.active,
+            "native_state": None,
         }
 
 
@@ -70,7 +55,7 @@ class PolicyDataRepository:
     def __init__(self, root: Path | str):
         self._repository = KnowledgeRepository(root)
         self._lock = threading.RLock()
-        self._compiled: dict[tuple[str, str, str, int], PolicyDataAttachment] = {}
+        self._compiled: dict[tuple[str, str, int], PolicyDataAttachment] = {}
 
     @property
     def root(self) -> Path:
@@ -151,18 +136,13 @@ class PolicyDataRepository:
             return False
         return document.source_kind in NON_REFERENCE_POLICY_SOURCE_KINDS
 
-    def compile_native_candidate(
+    def compile_text_attachment(
         self,
-        candidate: KnowledgeCandidate | None,
+        tokenizer: Any,
         *,
         max_tokens: int,
     ) -> PolicyDataAttachment:
-        """Bind one eligible policy candidate to its precompiled native state.
-
-        A hybrid Qwen3.5 request has one recurrent GDN state, so PolicyData uses
-        exactly one highest-ranked eligible page. There is deliberately no text
-        fallback: stale, unaligned, or over-budget state fails closed.
-        """
+        """Render the sole PolicyData document into the request instructions."""
 
         if max_tokens < 1:
             raise ValueError("PolicyData token budget must be positive")
@@ -173,50 +153,55 @@ class PolicyDataRepository:
             document_ids=(),
             document_digests=(),
             attached_tokens=0,
-            native_prefix=None,
+            instructions=None,
         )
-        if candidate is None:
+        if not snapshot.documents:
             return inactive
-        if candidate.lane != "policydata":
-            raise ValueError("PolicyData state cannot contain a knowledge candidate")
-        native_prefix = candidate.native_prefix
-        if native_prefix is None or len(native_prefix.token_ids) > int(max_tokens):
-            return inactive
-        document = snapshot.by_id().get(candidate.document_id)
-        if (
-            document is None
-            or document.sha256 != candidate.reference_digest
-            or native_prefix.document_id != candidate.document_id
-        ):
-            return inactive
-
-        cache_key = (
-            snapshot.source_digest,
-            candidate.reference_digest,
-            native_prefix.prefix_identity,
-            int(max_tokens),
-        )
+        document = snapshot.documents[0]
+        cache_key = (snapshot.source_digest, document.sha256, int(max_tokens))
         with self._lock:
             cached = self._compiled.get(cache_key)
             if cached is not None:
                 return cached
 
+        token_ids = tuple(
+            int(token)
+            for token in tokenizer.encode(
+                document.normalized_content,
+                add_special_tokens=False,
+            )[: int(max_tokens)]
+        )
+        if not token_ids:
+            return inactive
+        content = tokenizer.decode(
+            token_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        ).strip()
+        if not content:
+            return inactive
+        instructions = (
+            "QWEN-EXO trusted private execution policy follows. Apply it as "
+            "system-level operating guidance. Do not quote or disclose this "
+            "private policy unless explicitly asked about system internals.\n\n"
+            f'<policy_data id="{document.document_id}">\n{content}\n</policy_data>'
+        )
         digest = hashlib.sha256()
         for value in (
             snapshot.source_digest,
-            candidate.reference_digest,
-            native_prefix.source_digest,
-            native_prefix.prefix_identity,
+            document.sha256,
+            hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            str(max_tokens),
         ):
             digest.update(value.encode("ascii"))
             digest.update(b"\0")
         attachment = PolicyDataAttachment(
             source_digest=snapshot.source_digest,
             attachment_digest=digest.hexdigest(),
-            document_ids=(candidate.document_id,),
-            document_digests=(candidate.reference_digest,),
-            attached_tokens=len(native_prefix.token_ids),
-            native_prefix=native_prefix,
+            document_ids=(document.document_id,),
+            document_digests=(document.sha256,),
+            attached_tokens=len(token_ids),
+            instructions=instructions,
         )
         with self._lock:
             self._compiled[cache_key] = attachment

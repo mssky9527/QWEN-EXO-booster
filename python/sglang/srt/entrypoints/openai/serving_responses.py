@@ -28,6 +28,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse
 from openai_harmony import Message as OpenAIMessage
 from openai_harmony import Role
+from qwen_exo_booster.initial_gdn_request import bind_initial_gdn_request
 from qwen_exo_booster.memory_span import locate_memory_span
 from qwen_exo_booster.pipeline import response_memory_metadata
 from sglang.srt.entrypoints.context import (
@@ -847,16 +848,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                         if raw_request is not None
                         else None
                     )
-                    native_prefix_ids = tuple(
-                        getattr(memory_state, "radix_prefix_token_ids", ()) or ()
-                    )
-                    if native_prefix_ids:
-                        rendered_ids = (
-                            tokenizer.encode(engine_prompt)
-                            if isinstance(engine_prompt, str)
-                            else list(engine_prompt)
-                        )
-                        engine_prompt = [*native_prefix_ids, *rendered_ids]
                     # Calculate default max tokens from context length minus prompt length
                     if isinstance(engine_prompt, list):
                         prompt_length = len(engine_prompt)
@@ -909,39 +900,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                         ),
                     )
                     if qwen_exo_runtime is not None:
-                        custom_params = dict(sampling_params.get("custom_params") or {})
+                        custom_params, bound_extra_key = bind_initial_gdn_request(
+                            qwen_exo_runtime,
+                            custom_params=dict(
+                                sampling_params.get("custom_params") or {}
+                            ),
+                            extra_key=self._compute_extra_key(request),
+                        )
                         custom_params["qwen_exo_kind"] = "user"
                         if memory_state is not None:
-                            if native_prefix_ids:
-                                custom_params.update(
-                                    {
-                                        "qwen_exo_radix_prefix_page_id": (
-                                            memory_state.radix_prefix_page_id
-                                        ),
-                                        "qwen_exo_radix_prefix_identity": (
-                                            memory_state.radix_prefix_identity
-                                        ),
-                                        "qwen_exo_radix_prefix_tokens": len(
-                                            native_prefix_ids
-                                        ),
-                                    }
-                                )
-                                if (
-                                    memory_state.radix_prefix_source_digest
-                                    and memory_state.radix_prefix_local_positions
-                                ):
-                                    custom_params["qwen_exo_native_bank_selection"] = {
-                                        "source_digest": (
-                                            memory_state.radix_prefix_source_digest
-                                        ),
-                                        "page_id": memory_state.radix_prefix_page_id,
-                                        "local_positions": list(
-                                            memory_state.radix_prefix_local_positions
-                                        ),
-                                        "prefix_identity": (
-                                            memory_state.radix_prefix_identity
-                                        ),
-                                    }
                             memory_span = locate_memory_span(
                                 engine_prompt,
                                 tokenizer,
@@ -966,23 +933,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                                         "attachment_digest": memory_state.attachment_digest,
                                         "attached_tokens": memory_state.attached_tokens,
                                     },
-                                )
-                            if (
-                                native_prefix_ids
-                                and memory_state.radix_prefix_source_digest
-                                and memory_state.radix_prefix_local_positions
-                            ):
-                                custom_params.update(
-                                    {
-                                        "qwen_exo_memory_start": 0,
-                                        "qwen_exo_memory_length": len(
-                                            native_prefix_ids
-                                        ),
-                                        "qwen_exo_memory_key": (
-                                            "qwen-exo-native:"
-                                            f"{memory_state.radix_prefix_identity}"
-                                        ),
-                                    }
                                 )
                         score_bias_builder = getattr(
                             qwen_exo_runtime, "score_bias_payload", None
@@ -1041,6 +991,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         sampling_params["custom_params"] = custom_params
                     effective_extra_key = self._compute_extra_key(request)
                     if qwen_exo_runtime is not None:
+                        effective_extra_key = bound_extra_key
                         editor_marker = f"qwen-exo-editor={editor_cache_identity}"
                         effective_extra_key = (
                             f"{effective_extra_key}|{editor_marker}"
@@ -1105,7 +1056,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                         raw_request=raw_request,
                         response_request=request,
                         priority=request.priority,
-                        native_prefix_ids=native_prefix_ids,
                     )
                     if qwen_exo_runtime is not None:
                         generator = qwen_exo_runtime.track_generation(
@@ -1206,17 +1156,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                     created_time,
                 )
             try:
-                result: Union[
-                    ORJSONResponse, ResponsesResponse
-                ] = await self.responses_full_generator(
-                    request,
-                    sampling_params,
-                    result_generator,
-                    context,
-                    model_name,
-                    tokenizer,
-                    request_metadata,
-                    created_time=created_time,
+                result: Union[ORJSONResponse, ResponsesResponse] = (
+                    await self.responses_full_generator(
+                        request,
+                        sampling_params,
+                        result_generator,
+                        context,
+                        model_name,
+                        tokenizer,
+                        request_metadata,
+                        created_time=created_time,
+                    )
                 )
                 return result
             except HTTPException as exc:
@@ -3559,7 +3509,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             adapted_request.stream
             and self.tokenizer_manager.server_args.incremental_streaming_output
         )
-        native_prefix_ids = tuple(kwargs.get("native_prefix_ids") or ())
         thinking_enabled = (
             self._is_thinking_enabled_for_request(response_request)
             if response_request is not None
@@ -3690,12 +3639,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_tokens_before = getattr(context, "num_reasoning_tokens", 0)
             logger.info(
                 "QWEN_EXO_GENERATION_START request_id=%s generation_index=%d "
-                "prompt_tokens=%d native_prefix_tokens=%d reasoning_end_token_id=%s "
-                "max_reasoning_tokens=%d",
+                "prompt_tokens=%d reasoning_end_token_id=%s max_reasoning_tokens=%d",
                 request_id,
                 generation_index,
                 len(prompt_token_ids),
-                len(native_prefix_ids),
                 reasoning_end_token_id,
                 max_reasoning_tokens,
             )
@@ -4003,10 +3950,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Prepare for the next generation turn
             # Render the updated conversation for the next completion
-            prompt_token_ids = [
-                *native_prefix_ids,
-                *context.render_for_completion(),
-            ]
+            prompt_token_ids = list(context.render_for_completion())
 
             sampling_params = self._phase_two_sampling_params(
                 sampling_params,

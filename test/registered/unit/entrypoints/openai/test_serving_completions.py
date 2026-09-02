@@ -11,6 +11,7 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 import json
 import unittest
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import AsyncMock, Mock
 
@@ -58,12 +59,73 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.template_manager = _MockTemplateManager()
         self.sc = OpenAIServingCompletion(tm, self.template_manager)
         self.fastapi_request = Mock(spec=Request)
+        self.fastapi_request.headers = {}
 
     # ---------- prompt-handling ----------
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
+
+    def test_qwen_exo_completion_attaches_global_initial_gdn(self):
+        selection = {
+            "schema": "qwen-exo-session-initial-gdn-v1",
+            "source_digest": "a" * 64,
+            "state_identity": "b" * 64,
+            "cache_namespace": "qwen-exo:v1:request_prefix:global-gdn",
+            "scope": "global",
+        }
+        runtime = Mock()
+        runtime.initial_gdn_selection.return_value = selection
+        self.fastapi_request.app = SimpleNamespace(
+            state=SimpleNamespace(qwen_exo_runtime=runtime)
+        )
+        req = CompletionRequest(
+            model="x",
+            prompt="<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n",
+            session_id="session-a",
+            extra_key="client-salt",
+            max_tokens=8,
+        )
+
+        adapted, _ = self.sc._convert_to_internal_request(req, self.fastapi_request)
+
+        self.assertEqual(adapted.session_id, "session-a")
+        self.assertIsNone(adapted.session_params)
+        self.assertTrue(adapted.extra_key.startswith(selection["cache_namespace"]))
+        self.assertEqual(
+            adapted.sampling_params["custom_params"]["qwen_exo_kind"], "user"
+        )
+        self.assertEqual(
+            adapted.sampling_params["custom_params"]["qwen_exo_session_initial_gdn"],
+            selection,
+        )
+        runtime.initial_gdn_selection.assert_called_once_with()
+
+    def test_qwen_exo_completion_can_disable_initial_gdn_for_ab(self):
+        runtime = Mock()
+        self.fastapi_request.app = SimpleNamespace(
+            state=SimpleNamespace(qwen_exo_runtime=runtime)
+        )
+        req = CompletionRequest(
+            model="x",
+            prompt="hello",
+            extra_key="client-salt",
+            custom_params={"qwen_exo_disable_session_initial_gdn": True},
+            max_tokens=8,
+        )
+
+        adapted, _ = self.sc._convert_to_internal_request(req, self.fastapi_request)
+        custom_params = adapted.sampling_params["custom_params"]
+
+        self.assertEqual(custom_params["qwen_exo_kind"], "user")
+        self.assertNotIn("qwen_exo_disable_session_initial_gdn", custom_params)
+        self.assertNotIn("qwen_exo_session_initial_gdn", custom_params)
+        self.assertTrue(
+            adapted.extra_key.startswith("qwen-exo:v1:global-initial-gdn:disabled|")
+        )
+        self.assertTrue(adapted.extra_key.endswith("|client-salt"))
+        runtime.initial_gdn_selection.assert_not_called()
 
     # ---------- echo-handling ----------
     def test_echo_with_list_of_strings_streaming(self):

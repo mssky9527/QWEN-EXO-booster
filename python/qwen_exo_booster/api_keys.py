@@ -6,6 +6,7 @@ import os
 import secrets
 import tempfile
 import threading
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -204,6 +205,39 @@ class ApiKeyStore:
                 updated = document
             return {
                 **self._public_record(matched),
+                "revision": updated["revision"],
+            }
+
+    def delete(self, key_ids: Iterable[str]) -> dict[str, Any]:
+        """Permanently remove keys; an active key loses access at once.
+
+        ``revoke`` keeps the record for audit, so a long-lived deployment
+        accumulates dead entries. Deletion accepts a batch, drops matching
+        records in one atomic write, and reports ids that were not present
+        so repeated calls stay idempotent.
+        """
+        requested = list(dict.fromkeys(str(key_id) for key_id in key_ids))
+        if not requested:
+            raise ApiKeyStoreError("invalid_request", "至少选择一个 API 密钥")
+        wanted = set(requested)
+        with self._lock:
+            document = self._read_document()
+            records = list(document["keys"])
+            deleted = [
+                record for record in records if str(record.get("id") or "") in wanted
+            ]
+            if not deleted:
+                raise ApiKeyStoreError("key_not_found", "API 密钥不存在")
+            remaining = [
+                record
+                for record in records
+                if str(record.get("id") or "") not in wanted
+            ]
+            updated = self._write_document(remaining)
+            found = {str(record["id"]) for record in deleted}
+            return {
+                "deleted": [self._public_record(record) for record in deleted],
+                "missing": [key_id for key_id in requested if key_id not in found],
                 "revision": updated["revision"],
             }
 

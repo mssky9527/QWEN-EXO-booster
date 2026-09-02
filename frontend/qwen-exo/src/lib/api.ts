@@ -1,5 +1,6 @@
 import type {
   ActiveEditor,
+  ApiKeyDeletion,
   ApiKeyListing,
   ApiKeyInfo,
   CreatedApiKey,
@@ -557,6 +558,15 @@ export async function revokeApiKey(keyId: string) {
       method: "DELETE",
     })
   ).json()) as ApiKeyInfo;
+}
+
+export async function deleteApiKeys(ids: string[]) {
+  return (await (
+    await apiFetch("/api-keys/delete", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    })
+  ).json()) as ApiKeyDeletion;
 }
 
 export async function getModelId() {

@@ -34,6 +34,16 @@ from typing import (
     runtime_checkable,
 )
 
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
+from typing_extensions import Literal
+
 from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
@@ -44,15 +54,6 @@ from openai.types.responses import (
 )
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    field_validator,
-    model_serializer,
-    model_validator,
-)
-from typing_extensions import Literal
 
 try:
     from xgrammar import StructuralTag
@@ -1649,9 +1650,7 @@ class ResponsesCompactRequest(BaseModel):
     instructions: Optional[str] = None
     previous_response_id: Optional[str] = None
     prompt_cache_key: Optional[str] = None
-    request_id: str = Field(
-        default_factory=lambda: f"resp_compact_{uuid.uuid4().hex}"
-    )
+    request_id: str = Field(default_factory=lambda: f"resp_compact_{uuid.uuid4().hex}")
 
 
 class ResponsesResponse(BaseModel):
@@ -1763,14 +1762,20 @@ class ResponsesResponse(BaseModel):
             instructions=request.instructions,
             max_output_tokens=request.max_output_tokens,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
+            # The external OpenAI Responses event schema accepts ``high`` but
+            # not Qwen's native ``xhigh``/``max`` aliases. Keep the request's
+            # native effort for template rendering and serialize a compatible
+            # ceiling in response metadata.
             reasoning={
-                # OpenAI's response event schema represents an explicit
-                # no-reasoning request as a null effort, not the request-only
-                # "none" control value.
                 "effort": (
-                    request.reasoning.effort
-                    if request.reasoning and request.reasoning.effort != "none"
-                    else None
+                    "high"
+                    if request.reasoning
+                    and request.reasoning.effort in {"xhigh", "max"}
+                    else (
+                        request.reasoning.effort
+                        if request.reasoning and request.reasoning.effort != "none"
+                        else None
+                    )
                 ),
                 "summary": None,  # unused
             },

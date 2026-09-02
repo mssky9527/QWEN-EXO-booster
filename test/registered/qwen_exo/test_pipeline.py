@@ -509,7 +509,9 @@ def test_no_q_signal_fails_closed_without_text_ranking(tmp_path):
 
     prepared, state = prepare(pipeline, request, query_heads=())
 
-    assert prepared is request
+    assert prepared is not request
+    assert request.instructions in prepared.instructions
+    assert "NATIVE_ONLY_41C9" in prepared.instructions
     assert state.candidates == ()
     assert state.decisions == ()
     assert state.radix_prefix_page_id is None
@@ -541,16 +543,16 @@ def test_no_q_signal_restores_cognition_only_state(tmp_path):
 
     prepared, state = prepare(pipeline, request, query_heads=())
 
-    assert prepared.extra_key == selection.radix_namespace
-    assert state.radix_prefix_page_id == 1
-    assert state.radix_prefix_lane == "cognition"
-    assert state.radix_prefix_selection_reason == "cognition_always_on"
+    assert prepared.extra_key is None
+    assert state.radix_prefix_page_id is None
+    assert state.radix_prefix_lane is None
+    assert state.radix_prefix_selection_reason is None
     assert state.cognition_active is True
     assert state.cognition_conditioned is False
     assert state.public_dict()["cognition"] == {
         "active": True,
         "conditioned": False,
-        "page_id": 1,
+        "page_id": None,
         "source_tokens": 2,
         "qk_ranked": False,
     }
@@ -582,10 +584,10 @@ def test_no_q_signal_restores_policydata_as_the_default_personality(tmp_path):
         query_heads=(),
     )
 
-    assert prepared.extra_key == selection.radix_namespace
-    assert state.radix_prefix_page_id == 2
-    assert state.radix_prefix_lane == "policydata"
-    assert state.radix_prefix_selection_reason == "policydata_always_on"
+    assert prepared.extra_key is None
+    assert state.radix_prefix_page_id is None
+    assert state.radix_prefix_lane is None
+    assert state.radix_prefix_selection_reason is None
     assert state.cognition_active is False
     assert state.cognition_conditioned is False
     assert state.public_dict()["cognition"]["source_tokens"] == 0
@@ -609,15 +611,15 @@ def test_qk_knowledge_page_requires_semantic_judge(tmp_path):
 
     prepared, state = prepare(pipeline, request)
 
-    assert prepared.instructions == request.instructions
+    assert request.instructions in prepared.instructions
+    assert "FWPM_LAYER_ALE_AUTH_CONNECT_V4" in prepared.instructions
     assert len(state.decisions) == 1
     assert state.decisions[0].status is EligibilityStatus.ELIGIBLE
     assert state.selected_document_ids == (candidate.document_id,)
     assert state.knowledge_admission_mode == "semantic_eligibility"
-    assert state.radix_prefix_page_id == 3
-    assert state.radix_prefix_selection_reason == "query_qk"
-    assert state.private_attachment is None
-    assert state.attached_tokens == 0
+    assert state.radix_prefix_page_id is None
+    assert state.private_attachment is not None
+    assert state.attached_tokens > 0
     public = state.public_dict()
     assert public["proposed_candidates"][0]["tensor_score"] == 0.91
     assert public["proposed_candidates"][0]["candidate_origin"] == (
@@ -926,9 +928,10 @@ def test_qk_native_prefix_is_bound_only_after_judge_approval(tmp_path):
         for candidate in state.candidates
         if candidate.document_id == ranked.document_id
     )
-    assert selected.native_prefix is not None
-    assert selected.candidate_origin == "admitted_native_tensor_bank"
-    assert state.radix_prefix_page_id == 3
+    assert selected.native_prefix is None
+    assert selected.candidate_origin == "attention_q_native_tensor_bank"
+    assert state.radix_prefix_page_id is None
+    assert state.private_attachment is not None
     assert state.judge_bypassed_count == 0
 
 
@@ -1044,7 +1047,7 @@ def test_request_start_reviews_but_blocks_reflection_from_another_task(tmp_path)
     assert state.decisions[0].status is EligibilityStatus.INELIGIBLE
     assert state.decisions[0].judge_method.endswith(":task_scope")
     assert state.decisions[1].status is EligibilityStatus.ELIGIBLE
-    assert state.selected_document_ids == ()
+    assert state.selected_document_ids == (judge.calls[1][2][0].document_id,)
     (proposed,) = telemetry.by_type("tensor.candidates_proposed")
     assert proposed["task_scope_filtered_count"] == 1
     assert proposed["task_scope_filtered_candidate_ids"] == [other.candidate_id]
@@ -1082,7 +1085,7 @@ def test_comparative_selector_can_choose_lower_qk_candidate(tmp_path):
 
     assert len(judge.selection_calls) == 1
     assert state.selected_document_ids == (semantic_winner.document_id,)
-    assert state.radix_prefix_page_id == 4
+    assert state.radix_prefix_page_id is None
     assert state.knowledge_admission_mode == "comparative_semantic_selection"
     (judge_event,) = telemetry.by_type("semantic_judge.completed")
     assert judge_event["selection_method"] == "comparative_listwise"
@@ -1298,7 +1301,7 @@ def test_prefilter_routes_low_margin_candidates_to_comparative_judge(tmp_path):
     assert len(judge.selection_calls) == 1
     assert len(judge.selection_calls[0][2]) == 2
     assert state.selected_document_ids == (first.document_id,)
-    assert state.radix_prefix_page_id == 3
+    assert state.radix_prefix_page_id is None
     (prefilter,) = telemetry.by_type("qk.prefilter")
     assert prefilter["status"] == "passed"
     assert prefilter["reason"] == "ambiguous_candidates"
@@ -1396,7 +1399,7 @@ def test_prefilter_evidence_blocks_active_skip(tmp_path):
     assert prefilter["sent_to_judge"] == 2
 
 
-def test_qk_policy_page_uses_native_state_without_request_text(tmp_path):
+def test_policy_data_is_always_attached_as_trusted_text(tmp_path):
     repo = repository(tmp_path)
     policy = policy_repository(tmp_path)
     candidate = native_candidate(policy, "delivery.md", page_id=7, score=0.94)
@@ -1416,23 +1419,20 @@ def test_qk_policy_page_uses_native_state_without_request_text(tmp_path):
     )
 
     prepared, state = prepare(pipeline, request)
-    assert len(state.decisions) == 1
-    assert state.decisions[0].status is EligibilityStatus.ELIGIBLE
 
-    assert prepared.instructions == original
-    assert "NATIVE_ONLY_41C9" not in prepared.instructions
+    assert original in prepared.instructions
+    assert "NATIVE_ONLY_41C9" in prepared.instructions
     assert state.selected_document_ids == ()
     assert state.policy_document_ids == (candidate.document_id,)
     assert state.policy_attachment is not None
     assert state.policy_attachment.active is True
-    assert state.policy_attachment.public_dict()["text_attached"] is False
-    assert state.radix_prefix_lane == "policydata"
-    assert state.hybrid_restoration_mode == (
-        "native_policy_full_attention_kv_and_gdn_state"
-    )
+    assert state.policy_attachment.public_dict()["text_attached"] is True
+    assert state.policy_attachment.public_dict()["native_state"] is None
+    assert state.radix_prefix_lane is None
+    assert state.hybrid_restoration_mode == "none"
 
 
-def test_highest_raw_qk_score_wins_the_single_hybrid_state_slot(tmp_path):
+def test_qk_knowledge_is_text_attached_while_policy_stays_always_on(tmp_path):
     repo = repository(tmp_path)
     policy = policy_repository(tmp_path)
     knowledge = replace(
@@ -1450,25 +1450,27 @@ def test_highest_raw_qk_score_wins_the_single_hybrid_state_slot(tmp_path):
         tensor_bank=bank,
     )
 
-    _prepared, state = prepare(
+    prepared, state = prepare(
         pipeline, FakeRequest(request_id="resp-race", input="WFP delivery")
     )
 
     assert len(state.candidates) == 2
-    assert state.candidates[0].document_id == knowledge.document_id
-    assert state.radix_prefix_page_id == 3
-    assert state.radix_prefix_lane == "knowledge"
     assert state.selected_document_ids == (knowledge.document_id,)
-    assert state.policy_attachment is None
+    assert state.policy_attachment is not None
+    assert state.policy_attachment.active is True
+    assert "FWPM_LAYER_ALE_AUTH_CONNECT_V4" in prepared.instructions
+    assert "NATIVE_ONLY_41C9" in prepared.instructions
+    assert state.radix_prefix_page_id is None
+    assert state.section_delta_mode == "none"
 
 
-def test_policy_qk_page_over_budget_fails_closed(tmp_path):
+def test_policy_text_is_truncated_to_its_explicit_budget(tmp_path):
     repo = repository(tmp_path)
     policy = policy_repository(tmp_path)
     candidate = native_candidate(policy, "delivery.md", page_id=7, score=0.94)
     bank = FakeQKTensorBank((candidate,))
     pipeline = build_pipeline(
-        replace(config(tmp_path), max_policy_tokens=32),
+        replace(config(tmp_path), max_policy_tokens=4),
         repo,
         FakeTokenizer(),
         policy_data=policy,
@@ -1482,15 +1484,15 @@ def test_policy_qk_page_over_budget_fails_closed(tmp_path):
 
     prepared, state = prepare(pipeline, request)
 
-    assert prepared.instructions == request.instructions
-    assert state.policy_attachment is None
+    assert request.instructions in prepared.instructions
+    assert "<policy_data" in prepared.instructions
+    assert state.policy_attachment is not None
+    assert state.policy_attached_tokens == 4
     assert state.radix_prefix_page_id is None
-    assert state.policy_document_ids == ()
+    assert state.policy_document_ids == (candidate.document_id,)
 
 
-def test_turn_end_attractor_reuses_judge_admitted_candidate_and_is_rejudged(
-    tmp_path,
-):
+def test_turn_end_finalization_disables_native_attractor_and_rejudges_text(tmp_path):
     repo = repository(tmp_path)
     first_candidate = native_candidate(repo, "ctf.md", page_id=4, score=8.80)
     next_ranked_candidate = native_candidate(repo, "wfp.md", page_id=23, score=8.96)
@@ -1510,15 +1512,14 @@ def test_turn_end_attractor_reuses_judge_admitted_candidate_and_is_rejudged(
     rank_call_count = len(bank.rank_calls)
     bank.candidates = (next_ranked_candidate, first_candidate)
 
-    captured = asyncio.run(pipeline.capture_native_attractor(first.request_id))
+    finalized = asyncio.run(pipeline.finalize_request_state(first.request_id))
 
     assert len(bank.rank_calls) == rank_call_count
-    assert captured.next_attractor_status == "ready"
-    assert captured.query_heads == ()
-    assert captured.next_attractor_page_id == 4
-    assert captured.next_attractor_decision_id is not None
+    assert finalized.next_attractor_status == "disabled_global_initial_only"
+    assert finalized.query_heads == ()
+    assert finalized.next_attractor_page_id is None
 
-    _prepared, followup = prepare(
+    prepared, followup = prepare(
         pipeline,
         FakeRequest(
             request_id="resp-attractor-2",
@@ -1526,9 +1527,10 @@ def test_turn_end_attractor_reuses_judge_admitted_candidate_and_is_rejudged(
             input="Continue",
         ),
     )
-    assert followup.restoration_status == "attractor_restored"
-    assert followup.radix_prefix_page_id == 4
-    assert followup.radix_prefix_selection_reason == "restored"
+    assert followup.restoration_status == "not_requested"
+    assert followup.radix_prefix_page_id is None
+    assert first_candidate.document_id in followup.selected_document_ids
+    assert "CTF heap exploitation" in prepared.instructions
     assert len(followup.decisions) == 2
 
 
@@ -1567,10 +1569,11 @@ def test_next_turn_restoration_rechecks_semantic_eligibility(tmp_path):
     assert state.restoration_status == "restored"
     assert state.restoration_decision_id is None
     assert len(state.decisions) == 1
-    assert state.radix_prefix_page_id == 11
-    assert state.radix_prefix_selection_reason == "restored"
-    assert prepared.extra_key == candidate.native_prefix.radix_namespace
-    assert state.private_attachment is None
+    assert state.radix_prefix_page_id is None
+    assert state.hybrid_restoration_mode == "text_reference_context"
+    assert state.private_attachment is not None
+    assert "FWPM_LAYER_ALE_AUTH_CONNECT_V4" in prepared.instructions
+    assert "private answer" in prepared.instructions
 
 
 def test_stale_restoration_digest_fails_closed(tmp_path):

@@ -4,7 +4,6 @@ import unittest
 from types import SimpleNamespace
 
 import torch
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -101,6 +100,24 @@ class TestKVPageInvariants(CustomTestCase):
         chk.get_last_batch = lambda: SimpleNamespace(reqs=[_FakeReq("a", 0, 1, 1)])
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
+
+    def test_reserved_mamba_slot_is_explicitly_accounted(self):
+        from sglang.srt.managers.scheduler_components.invariant_checker import (
+            SchedulerInvariantChecker,
+        )
+
+        leak, message = SchedulerInvariantChecker._check_pool_invariant(
+            "mamba",
+            available=3,
+            evictable=0,
+            protected=0,
+            session_held=0,
+            total=4,
+            reserved=1,
+        )
+
+        self.assertFalse(leak)
+        self.assertIn("reserved=1", message)
 
 
 if __name__ == "__main__":

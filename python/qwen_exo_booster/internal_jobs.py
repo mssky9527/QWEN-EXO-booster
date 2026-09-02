@@ -34,9 +34,11 @@ def _internal_custom_params(
         "qwen_exo_parent_request_id": job.parent_request_id,
         "qwen_exo_state_budget_bytes": job.state_budget_bytes,
     }
+    force_target_only = custom.get("qwen_exo_dflash") == "target_only"
     requested = custom.get("qwen_exo_dflash") == "eligible"
     eligible = (
-        allow_dflash
+        not force_target_only
+        and allow_dflash
         and (job.job_type in _DFLASH_ELIGIBLE_JOB_TYPES or requested)
         and job.token_budget >= 32
         and not any(
