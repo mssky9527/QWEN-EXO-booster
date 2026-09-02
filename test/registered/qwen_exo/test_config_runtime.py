@@ -3,6 +3,7 @@ import asyncio
 import json
 import sys
 import threading
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
@@ -911,21 +912,31 @@ def test_new_memory_refresh_runs_in_background_and_coalesces():
     asyncio.run(scenario())
 
 
-def test_initial_gdn_selection_uses_global_snapshot():
+def _selection_runtime(identity):
     runtime = object.__new__(QwenExoRuntime)
     runtime._session_initial_gdn_value_lock = threading.RLock()
+    runtime._session_initial_gdn_pins = OrderedDict()
     runtime._session_initial_gdn_value = {
         "source_digest": "a" * 64,
-        "state_identity": "1" * 64,
+        "state_identity": identity,
     }
+    return runtime
 
-    first = runtime.initial_gdn_selection()
-    same_snapshot = runtime.initial_gdn_selection()
+
+def _swap_global_identity(runtime, identity):
     with runtime._session_initial_gdn_value_lock:
         runtime._session_initial_gdn_value = {
             "source_digest": "b" * 64,
-            "state_identity": "2" * 64,
+            "state_identity": identity,
         }
+
+
+def test_initial_gdn_selection_uses_global_snapshot():
+    runtime = _selection_runtime("1" * 64)
+
+    first = runtime.initial_gdn_selection()
+    same_snapshot = runtime.initial_gdn_selection()
+    _swap_global_identity(runtime, "2" * 64)
     refreshed = runtime.initial_gdn_selection()
 
     assert first["state_identity"] == "1" * 64
@@ -934,6 +945,58 @@ def test_initial_gdn_selection_uses_global_snapshot():
     assert refreshed["cache_namespace"] != first["cache_namespace"]
     assert first["scope"] == "global"
     assert refreshed["scope"] == "global"
+
+
+def test_continued_conversation_keeps_its_initial_gdn_across_refresh():
+    """A refresh must not change the identity of an in-flight conversation.
+
+    Switching a 97K-token conversation to the new namespace threw away its
+    whole radix-cached prefix and forced a full re-prefill on the next turn,
+    which is what produced the multi-minute first-token stalls after every
+    refresh. The turn that continues a response keeps that response's pin;
+    only a conversation without a known parent picks up the refreshed state.
+    """
+    runtime = _selection_runtime("1" * 64)
+
+    opened = runtime.initial_gdn_selection(response_id="resp_1")
+    _swap_global_identity(runtime, "2" * 64)
+    continued = runtime.initial_gdn_selection(
+        previous_response_id="resp_1", response_id="resp_2"
+    )
+    chained = runtime.initial_gdn_selection(
+        previous_response_id="resp_2", response_id="resp_3"
+    )
+    fresh = runtime.initial_gdn_selection(response_id="resp_new")
+    unknown_parent = runtime.initial_gdn_selection(
+        previous_response_id="resp_from_before_restart", response_id="resp_x"
+    )
+
+    assert opened["state_identity"] == "1" * 64
+    assert continued == opened
+    assert chained == opened
+    assert fresh["state_identity"] == "2" * 64
+    assert unknown_parent["state_identity"] == "2" * 64
+    # Read-only lookups (no response_id) never create pins.
+    runtime.initial_gdn_selection(previous_response_id="resp_1")
+    assert set(runtime._session_initial_gdn_pins) == {
+        "resp_1",
+        "resp_2",
+        "resp_3",
+        "resp_new",
+        "resp_x",
+    }
+
+
+def test_initial_gdn_pins_are_bounded_lru():
+    runtime = _selection_runtime("1" * 64)
+    from qwen_exo_booster import runtime as runtime_module
+
+    limit = runtime_module._SESSION_INITIAL_GDN_MAX_PINS
+    for index in range(limit + 5):
+        runtime.initial_gdn_selection(response_id=f"resp_{index}")
+    assert len(runtime._session_initial_gdn_pins) == limit
+    assert "resp_0" not in runtime._session_initial_gdn_pins
+    assert f"resp_{limit + 4}" in runtime._session_initial_gdn_pins
 
 
 def test_responses_default_to_high_thinking_without_overriding_explicit_choice():

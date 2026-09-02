@@ -23,20 +23,31 @@ def bind_initial_gdn_request(
     *,
     custom_params: dict[str, Any],
     extra_key: str | None,
+    previous_response_id: str | None = None,
+    response_id: str | None = None,
 ) -> tuple[dict[str, Any], str]:
-    """Return request custom params and radix key bound to the global initial GDN.
+    """Return request custom params and radix key bound to the initial GDN.
 
     Client-supplied artifact identities are never trusted; the runtime chooses
-    the current global snapshot. ``qwen_exo_disable_session_initial_gdn``
-    opts one request out (for A/B comparison). Requests without a bound state
-    move to their own namespace so they never reuse cached recurrent state
-    that descends from an initial GDN, and vice versa.
+    the snapshot. A conversation continued via ``previous_response_id`` keeps
+    the snapshot it started with (pinned under ``response_id`` for the next
+    turn); new conversations get the current global one.
+    ``qwen_exo_disable_session_initial_gdn`` opts one request out (for A/B
+    comparison). Requests without a bound state move to their own namespace so
+    they never reuse cached recurrent state that descends from an initial GDN,
+    and vice versa.
     """
 
     params = dict(custom_params)
     disabled = params.pop(DISABLE_INITIAL_GDN_PARAM, None) is True
     params.pop(INITIAL_GDN_PARAM, None)
-    selection = None if disabled else runtime.initial_gdn_selection()
+    selection = (
+        None
+        if disabled
+        else runtime.initial_gdn_selection(
+            previous_response_id=previous_response_id, response_id=response_id
+        )
+    )
     if isinstance(selection, dict) and selection.get("cache_namespace"):
         params[INITIAL_GDN_PARAM] = dict(selection)
         namespace = str(selection["cache_namespace"])

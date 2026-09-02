@@ -100,7 +100,9 @@ class ServingCompletionTestCase(unittest.TestCase):
             adapted.sampling_params["custom_params"]["qwen_exo_session_initial_gdn"],
             selection,
         )
-        runtime.initial_gdn_selection.assert_called_once_with()
+        runtime.initial_gdn_selection.assert_called_once_with(
+            previous_response_id=None, response_id=None
+        )
 
     def test_qwen_exo_completion_can_disable_initial_gdn_for_ab(self):
         runtime = Mock()

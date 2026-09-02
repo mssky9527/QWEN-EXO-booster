@@ -154,7 +154,7 @@ class ServingChatTestCase(unittest.TestCase):
 
     def _qwen_exo_runtime(self, selection, personality=None):
         runtime = SimpleNamespace(
-            initial_gdn_selection=lambda: selection,
+            initial_gdn_selection=lambda **_kwargs: selection,
             personality_instructions=lambda: personality,
             activation_editor_request=lambda _spec: {
                 "spec": None,

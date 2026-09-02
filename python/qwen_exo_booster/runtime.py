@@ -131,6 +131,8 @@ _SESSION_INITIAL_GDN_OUTPUT_TOKENS = 12288
 _SESSION_INITIAL_GDN_SCHEMA = "qwen-exo-session-initial-gdn-v1"
 _SESSION_INITIAL_GDN_CACHE_PREFIX = "qwen-exo:v1:session-initial-gdn:"
 _SESSION_INITIAL_GDN_CONTEXT_RESERVE = 256
+# Conversations remembered for identity pinning (response_id -> selection).
+_SESSION_INITIAL_GDN_MAX_PINS = 4096
 _SESSION_INITIAL_GDN_SYSTEM = (
     "You are consolidating your own persisted long-term memory into the initial "
     "recurrent state that every future conversation starts from. The user "
@@ -432,6 +434,13 @@ class QwenExoRuntime:
         self._session_initial_gdn_refresh_requested: str | None = None
         self._session_initial_gdn_value_lock = threading.RLock()
         self._session_initial_gdn_value: dict[str, Any] | None = None
+        # response_id -> selection the conversation started with. A refreshed
+        # global state only applies to new conversations; continuing ones keep
+        # their identity so their radix-cached prefix (up to ~100K tokens) is
+        # not invalidated by a namespace change mid-conversation.
+        self._session_initial_gdn_pins: OrderedDict[str, dict[str, Any]] = (
+            OrderedDict()
+        )
         self._session_initial_gdn_status: dict[str, Any] = {
             "schema": _SESSION_INITIAL_GDN_SCHEMA,
             "status": "not_started",
@@ -1645,6 +1654,8 @@ class QwenExoRuntime:
             refresh_task = self._session_initial_gdn_refresh_task
             if refresh_task is not None and not refresh_task.done():
                 refresh_task.cancel()
+            with self._session_initial_gdn_value_lock:
+                self._session_initial_gdn_pins.clear()
             self._session_initial_gdn_refresh_task = None
             self._session_initial_gdn_refresh_requested = None
             with self._session_initial_gdn_value_lock:
@@ -1663,22 +1674,48 @@ class QwenExoRuntime:
                 self.adaptive_retrieval.clear()
             self.state = QwenExoRuntimeState.STOPPED
 
-    def initial_gdn_selection(self) -> dict[str, Any] | None:
-        """Return the current runtime-wide initial GDN snapshot.
+    def initial_gdn_selection(
+        self,
+        *,
+        previous_response_id: str | None = None,
+        response_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the initial GDN snapshot a request must start from.
 
-        The snapshot is built once at startup (or refreshed after a new
-        reflection is stored). It is an initial condition for each sequence;
-        the mutable recurrent state remains request-local after the scheduler
-        performs its copy-on-write bind.
+        The global snapshot is built once at startup and refreshed after a new
+        reflection is stored. A conversation continued through
+        ``previous_response_id`` keeps the snapshot it started with, so a
+        refresh never changes its cache namespace or recurrent origin
+        mid-conversation; only new conversations pick up the refreshed state.
+        The chosen selection is pinned under ``response_id`` for the next turn.
         """
         with self._session_initial_gdn_value_lock:
-            value = (
-                dict(self._session_initial_gdn_value)
-                if self._session_initial_gdn_value is not None
+            pinned = (
+                self._session_initial_gdn_pins.get(str(previous_response_id))
+                if previous_response_id
                 else None
             )
-        if value is None:
-            return None
+            if pinned is not None:
+                self._session_initial_gdn_pins.move_to_end(str(previous_response_id))
+                selection = dict(pinned)
+            else:
+                value = self._session_initial_gdn_value
+                selection = (
+                    self._session_initial_gdn_selection_for(value)
+                    if value is not None
+                    else None
+                )
+            if response_id and selection is not None:
+                self._session_initial_gdn_pins[str(response_id)] = dict(selection)
+                while (
+                    len(self._session_initial_gdn_pins)
+                    > _SESSION_INITIAL_GDN_MAX_PINS
+                ):
+                    self._session_initial_gdn_pins.popitem(last=False)
+        return selection
+
+    @staticmethod
+    def _session_initial_gdn_selection_for(value: dict[str, Any]) -> dict[str, Any]:
         cache_namespace = HybridRuntimePolicy.namespace_key(
             HybridStateNamespace.REQUEST_PREFIX,
             stable_digest(
@@ -2045,7 +2082,9 @@ class QwenExoRuntime:
         # Responses entrypoint together with the selection itself, so internal
         # jobs (which start from a zero recurrent state) keep the pipeline's
         # own memory namespace and never share cached state with bound requests.
-        selection = self.initial_gdn_selection()
+        selection = self.initial_gdn_selection(
+            previous_response_id=getattr(request, "previous_response_id", None)
+        )
         self._raise_if_cancelled(request.request_id)
         self.telemetry.emit(
             request.request_id,
@@ -8182,6 +8221,10 @@ class QwenExoRuntime:
         session_initial_gdn["refresh_pending"] = (
             refresh_task is not None and not refresh_task.done()
         )
+        with self._session_initial_gdn_value_lock:
+            session_initial_gdn["pinned_conversations"] = len(
+                self._session_initial_gdn_pins
+            )
         return {
             **self.config.public_dict(),
             "runtime_state": self.state.value,

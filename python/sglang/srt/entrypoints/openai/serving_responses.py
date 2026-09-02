@@ -906,6 +906,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 sampling_params.get("custom_params") or {}
                             ),
                             extra_key=self._compute_extra_key(request),
+                            previous_response_id=request.previous_response_id,
+                            response_id=request.request_id,
                         )
                         custom_params["qwen_exo_kind"] = "user"
                         if memory_state is not None:
