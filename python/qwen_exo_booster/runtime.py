@@ -1013,6 +1013,21 @@ class QwenExoRuntime:
         )
         return dict(value)
 
+    def _session_initial_gdn_dflash_mode(self) -> str:
+        """Schedule the consolidation alongside user traffic.
+
+        The scheduler never mixes target-only requests with DFLASH-eligible
+        ones in a batch, so a target-only consolidation (41K prompt, up to
+        12K output) parked every user request until it finished. Running it
+        DFLASH-eligible lets users co-schedule; the ReplaySSM spec ring is the
+        one configuration where the export needs a flushed ring, so it keeps
+        the target-only path.
+        """
+        server_args = getattr(self.tokenizer_manager, "server_args", None)
+        if bool(getattr(server_args, "enable_gdn_replayssm_spec", False)):
+            return "target_only"
+        return "eligible"
+
     async def _refresh_session_initial_gdn(
         self, *, reason: str
     ) -> dict[str, Any] | None:
@@ -1096,8 +1111,10 @@ class QwenExoRuntime:
                             "top_k": -1,
                             "skip_special_tokens": True,
                             "custom_params": {
-                                "qwen_exo_dflash": "target_only",
-                                "qwen_exo_dflash_think_phase": True,
+                                "qwen_exo_dflash": self._session_initial_gdn_dflash_mode(),
+                                # Strict acceptance only: the exported state must
+                                # follow the target distribution exactly.
+                                "qwen_exo_dflash_think_phase": False,
                             },
                         },
                         custom_params_per_job=(

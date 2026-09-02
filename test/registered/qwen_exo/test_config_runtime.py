@@ -631,6 +631,16 @@ def test_runtime_startup_warmup_records_native_probe_result():
     assert events[0][2]["cache_hit"] is False
 
 
+def test_session_initial_gdn_keeps_target_only_under_replayssm_spec():
+    runtime = object.__new__(QwenExoRuntime)
+    runtime.tokenizer_manager = SimpleNamespace(
+        server_args=SimpleNamespace(enable_gdn_replayssm_spec=True)
+    )
+    assert runtime._session_initial_gdn_dflash_mode() == "target_only"
+    runtime.tokenizer_manager = SimpleNamespace(server_args=SimpleNamespace())
+    assert runtime._session_initial_gdn_dflash_mode() == "eligible"
+
+
 def test_startup_without_memories_serves_without_initial_gdn():
     """A fresh deployment has no reflection memories and must still come up.
 
@@ -705,6 +715,9 @@ def test_runtime_startup_generation_builds_global_session_gdn(tmp_path):
 
     runtime = object.__new__(QwenExoRuntime)
     runtime.internal_jobs = Runner()
+    runtime.tokenizer_manager = SimpleNamespace(
+        server_args=SimpleNamespace(enable_gdn_replayssm_spec=False)
+    )
     runtime.config = SimpleNamespace(
         context_length=128, max_internal_tokens=32, state_directory=tmp_path
     )
@@ -735,11 +748,12 @@ def test_runtime_startup_generation_builds_global_session_gdn(tmp_path):
     assert jobs[0].job_type.value == "reflection_memory"
     assert jobs[0].deadline_monotonic is None
     assert prompts == ("rendered recent memories",)
-    # Speculative decoding stays off so the exported recurrent state is fully
-    # flushed; the consolidation itself thinks before writing the reflection.
+    # DFLASH-eligible so user requests co-schedule with the consolidation
+    # (target-only requests exclude eligible ones from the batch), with strict
+    # acceptance so the exported state follows the target distribution.
     assert sampling_params["custom_params"] == {
-        "qwen_exo_dflash": "target_only",
-        "qwen_exo_dflash_think_phase": True,
+        "qwen_exo_dflash": "eligible",
+        "qwen_exo_dflash_think_phase": False,
     }
     assert kwargs["custom_params_per_job"] == (
         {
