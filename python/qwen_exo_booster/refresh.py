@@ -22,6 +22,7 @@ from qwen_exo_booster.knowledge import (
     KnowledgeCandidate,
     KnowledgeRepository,
     is_compatible_reflection_memory,
+    CROSS_TASK_REFLECTION_NOTE,
     question_names_document,
     reflection_memory_matches_task,
     reflection_task_category,
@@ -420,24 +421,6 @@ class SelfAskRefreshService:
         )
         return kept, len(filtered_keys)
 
-    @staticmethod
-    def _scope_gate_decision(
-        decision: EligibilityDecision,
-        candidate: KnowledgeCandidate,
-        question: str,
-    ) -> EligibilityDecision:
-        if decision.status is not EligibilityStatus.ELIGIBLE:
-            return decision
-        return EligibilityDecision.create(
-            candidate_id=decision.candidate_id,
-            parent_request_id=decision.parent_request_id,
-            question=question,
-            reference=candidate.reference_content,
-            status=EligibilityStatus.INELIGIBLE,
-            judge_method=f"{decision.judge_method}:task_scope",
-            judge_model_fingerprint=decision.judge_model_fingerprint,
-            decision_margin=0.0,
-        )
 
     def _exact_task_reflection_candidates(
         self, original_task: str, query: str
@@ -721,9 +704,14 @@ class SelfAskRefreshService:
                     ],
                 )
                 bypassed_knowledge_candidates: tuple[KnowledgeCandidate, ...] = ()
-                judged_candidates = (
-                    *qk_policy_candidates,
-                    *knowledge_candidates,
+                judged_candidates = tuple(
+                    (
+                        replace(candidate, scope_note=CROSS_TASK_REFLECTION_NOTE)
+                        if self._candidate_scope_key(candidate)
+                        in task_scope_filtered_key_set
+                        else candidate
+                    )
+                    for candidate in (*qk_policy_candidates, *knowledge_candidates)
                 )
                 proposed = (
                     *direct_candidates,
@@ -742,7 +730,6 @@ class SelfAskRefreshService:
                     self_question,
                     judged_candidates,
                     judged_references,
-                    task_scope_filtered_key_set,
                 )
                 eligible_candidates = (
                     *direct_candidates,
@@ -758,16 +745,7 @@ class SelfAskRefreshService:
                     decision.candidate_id: decision for decision in raw_decisions
                 }
                 judged_decisions = tuple(
-                    (
-                        self._scope_gate_decision(
-                            raw_decisions_by_id[candidate.candidate_id],
-                            candidate,
-                            self_question,
-                        )
-                        if self._candidate_scope_key(candidate)
-                        in task_scope_filtered_key_set
-                        else raw_decisions_by_id[candidate.candidate_id]
-                    )
+                    raw_decisions_by_id[candidate.candidate_id]
                     for candidate in judged_candidates
                     if candidate.candidate_id in raw_decisions_by_id
                 )

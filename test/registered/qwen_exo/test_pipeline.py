@@ -1002,7 +1002,15 @@ def test_reflection_collection_label_does_not_merge_distinct_memories(tmp_path):
     assert state.selected_document_ids == (first.document_id,)
 
 
-def test_request_start_reviews_but_blocks_reflection_from_another_task(tmp_path):
+def test_request_start_marks_cross_task_reflection_for_the_judge(tmp_path):
+    """A reflection from another task reaches the judge with its provenance.
+
+    Reflection categories are per-task digests, so a hard cross-task gate
+    made every past experience unreachable from a new conversation (5/5 live
+    questions recalled the right memory at rank 1 and attached nothing). The
+    judge now sees a scope note on such candidates and may select them; the
+    same-task exact candidate is still offered alongside.
+    """
     repo = KnowledgeRepository(tmp_path / "reflection-scope")
     target_task = "Please solve this issue: add implicit HEAD and OPTIONS routing"
     other_task = "Please solve this issue: add deprecated response headers"
@@ -1020,7 +1028,7 @@ def test_request_start_reviews_but_blocks_reflection_from_another_task(tmp_path)
     other = native_candidate(repo, "reflection-memory/other.md", page_id=3, score=0.99)
     bank = FakeQKTensorBank((other,))
     telemetry = FakeTelemetry()
-    judge = FakeReferenceJudge(supported=True)
+    judge = FakeReferenceJudge(supported=True, winner_path="reflection-memory/other.md")
     pipeline = build_pipeline(
         config(tmp_path, policy_data=False),
         repo,
@@ -1041,17 +1049,19 @@ def test_request_start_reviews_but_blocks_reflection_from_another_task(tmp_path)
         )
     )
 
-    assert [candidate.relative_path for candidate in judge.calls[0][2]] == [
+    assert len(judge.calls) == 1
+    presented = {candidate.relative_path: candidate for candidate in judge.calls[0][2]}
+    assert set(presented) == {
         "reflection-memory/other.md",
         "reflection-memory/target.md",
-    ]
-    assert [candidate.relative_path for candidate in judge.calls[1][2]] == [
-        "reflection-memory/target.md"
-    ]
-    assert state.decisions[0].status is EligibilityStatus.INELIGIBLE
-    assert state.decisions[0].judge_method.endswith(":task_scope")
-    assert state.decisions[1].status is EligibilityStatus.ELIGIBLE
-    assert state.selected_document_ids == (judge.calls[1][2][0].document_id,)
+    }
+    assert presented["reflection-memory/other.md"].scope_note is not None
+    assert presented["reflection-memory/target.md"].scope_note is None
+    # The judge's choice of the cross-task reflection stands.
+    assert not any(
+        decision.judge_method.endswith(":task_scope") for decision in state.decisions
+    )
+    assert state.selected_document_ids == (other.document_id,)
     (proposed,) = telemetry.by_type("tensor.candidates_proposed")
     assert proposed["task_scope_filtered_count"] == 1
     assert proposed["task_scope_filtered_candidate_ids"] == [other.candidate_id]
@@ -1060,7 +1070,7 @@ def test_request_start_reviews_but_blocks_reflection_from_another_task(tmp_path)
     (completed,) = telemetry.by_type("semantic_judge.completed")
     assert completed["candidate_count"] == 2
     assert completed["task_scope_blocked_count"] == 1
-    assert completed["judge_wave_count"] == 2
+    assert completed["judge_wave_count"] == 1
 
 
 def test_reflection_named_by_the_question_bypasses_the_task_scope_gate(tmp_path):

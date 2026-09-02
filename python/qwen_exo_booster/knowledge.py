@@ -255,6 +255,11 @@ def reflection_task_category(original_task: str) -> str:
     return f"reflection-task-{slug + '-' if slug else ''}{digest}"
 
 
+CROSS_TASK_REFLECTION_NOTE = (
+    "This reflection memory was distilled from a different task than the current "
+    "one. Select it only when its reusable rule, evidence, or stop condition "
+    "directly applies to the question; shared topic alone is insufficient."
+)
 _TITLE_SEGMENT_SPLIT = re.compile(r"[：:｜|—\-–,，、;；()（）\[\]【】/]+")
 
 
@@ -401,6 +406,9 @@ class KnowledgeCandidate:
     qk_attributions: tuple[QueryQKAttribution, ...] = ()
     candidate_origin: str = "lexical"
     native_prefix: NativePrefixSelection | None = field(default=None, repr=False)
+    # Provenance shown to the judge next to the reference, e.g. that a
+    # reflection was distilled from a different task than the current one.
+    scope_note: str | None = None
 
     def public_dict(self) -> dict[str, object]:
         return {

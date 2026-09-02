@@ -622,3 +622,35 @@ def test_judge_bounds_oversize_reference_and_keeps_batch_alive(tmp_path):
     assert result.decisions[0].status is EligibilityStatus.ELIGIBLE
     assert "filler" * 4000 not in runner.prompts[0]
     assert "中间省略" in runner.prompts[0]
+
+
+def test_scope_note_is_shown_to_the_judge_and_splits_the_cache(tmp_path):
+    """Cross-task provenance must reach the judge and not reuse an unscoped verdict.
+
+    The note is the only thing that distinguishes a reflection offered inside
+    its own task from the same reflection offered to another task; a decision
+    cached without the note must not answer for the scoped candidate.
+    """
+    from qwen_exo_booster.knowledge import CROSS_TASK_REFLECTION_NOTE
+
+    repository, (wfp, ctf) = repository_with_candidates(tmp_path)
+    judge = ReferenceJudge(
+        FakeRunner(), repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
+    )
+    scoped = replace(wfp, scope_note=CROSS_TASK_REFLECTION_NOTE)
+
+    selection_prompt = judge._render_selection_prompt("q", (scoped, ctf), ("A", "B"))
+    payload = json.loads(selection_prompt.split("<user>", 1)[1])
+    binary_prompt = judge._render_prompt(
+        question="q", reference="rule", lane="knowledge", scope_note=scoped.scope_note
+    )
+
+    scoped_items = [item for item in payload["candidates"] if "scope" in item]
+    assert len(scoped_items) == 1
+    assert scoped_items[0]["scope"] == CROSS_TASK_REFLECTION_NOTE
+    assert scoped_items[0]["source"] == "wfp.md"
+    assert '"scope":' in binary_prompt
+    assert judge._cache_key("q", scoped) != judge._cache_key("q", wfp)
+    assert judge._selection_cache_key("q", (scoped, ctf)) != judge._selection_cache_key(
+        "q", (wfp, ctf)
+    )

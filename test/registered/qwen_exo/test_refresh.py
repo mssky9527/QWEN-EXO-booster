@@ -288,7 +288,9 @@ def test_refresh_filters_task_scoped_reflection_from_another_task(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_refresh_reviews_but_blocks_scope_mismatched_reflection(tmp_path):
+async def test_refresh_marks_scope_mismatched_reflection_and_lets_judge_decide(
+    tmp_path,
+):
     service, repo = build_service(tmp_path, FakeManager(all_supported=True))
     target_task = "Please solve this issue: add implicit HEAD and OPTIONS routing"
     other_task = "Please solve this issue: add deprecated response headers"
@@ -328,8 +330,8 @@ async def test_refresh_reviews_but_blocks_scope_mismatched_reflection(tmp_path):
         for decision in decisions
         if decision.candidate_id == other_candidate.candidate_id
     )
-    assert other_decision.status is EligibilityStatus.INELIGIBLE
-    assert other_decision.judge_method.endswith(":task_scope")
+    assert other_decision.status is EligibilityStatus.ELIGIBLE
+    assert not other_decision.judge_method.endswith(":task_scope")
     completed = [
         event.payload
         for event in service.telemetry.events("request-refresh-scope")

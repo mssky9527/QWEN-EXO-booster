@@ -18,6 +18,7 @@ from qwen_exo_booster.contracts import (
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
 from qwen_exo_booster.judge import JudgeBatchResult
 from qwen_exo_booster.knowledge import (
+    CROSS_TASK_REFLECTION_NOTE,
     KnowledgeCandidate,
     KnowledgeRepository,
     is_compatible_reflection_memory,
@@ -546,24 +547,6 @@ class MemoryPipeline:
         )
         return kept, len(filtered_keys)
 
-    @staticmethod
-    def _scope_gate_decision(
-        decision: EligibilityDecision,
-        candidate: KnowledgeCandidate,
-        question: str,
-    ) -> EligibilityDecision:
-        if decision.status is not EligibilityStatus.ELIGIBLE:
-            return decision
-        return EligibilityDecision.create(
-            candidate_id=decision.candidate_id,
-            parent_request_id=decision.parent_request_id,
-            question=question,
-            reference=candidate.reference_content,
-            status=EligibilityStatus.INELIGIBLE,
-            judge_method=f"{decision.judge_method}:task_scope",
-            judge_model_fingerprint=decision.judge_model_fingerprint,
-            decision_margin=0.0,
-        )
 
     def _exact_task_reflection_candidates(
         self, original_task: str, query: str
@@ -784,12 +767,21 @@ class MemoryPipeline:
         )
         score_filtered_count = len(supplemental) - len(supplemental_judged)
         qk_score_filtered_count = 0
-        blocked_judged = tuple(
-            candidate
+        # Cross-task reflections are not blocked; the judge sees their
+        # provenance and decides whether the reusable rule applies. Reflection
+        # categories are per-task digests, so a hard gate made every past
+        # experience unreachable from a new conversation.
+        judged = tuple(
+            (
+                replace(candidate, scope_note=CROSS_TASK_REFLECTION_NOTE)
+                if self._candidate_scope_key(candidate) in task_scope_blocked_keys
+                else candidate
+            )
             for candidate in judged
-            if self._candidate_scope_key(candidate) in task_scope_blocked_keys
         )
-        blocked_ids = frozenset(candidate.candidate_id for candidate in blocked_judged)
+        blocked_judged = tuple(
+            candidate for candidate in judged if candidate.scope_note is not None
+        )
         judge_available = (
             self.reference_judge is not None
             and self.config.feature_flags.reference_judge
@@ -877,35 +869,6 @@ class MemoryPipeline:
                 selected_candidate_id = getattr(
                     first_batch, "selected_candidate_id", None
                 )
-                # A task-scoped reflection may be reviewed, but it must not
-                # win the shared listwise decision. Re-run only the safe set
-                # when the first comparison chose a blocked reflection.
-                if selected_candidate_id in blocked_ids:
-                    safe_judged = tuple(
-                        candidate
-                        for candidate in judged
-                        if candidate.candidate_id not in blocked_ids
-                    )
-                    if safe_judged:
-                        safe_kwargs = {
-                            **judge_kwargs,
-                            "turn_id": f"{request_id}:request-admission-judge:scope-safe",
-                            "candidates": safe_judged,
-                            "telemetry_correlation_id": (
-                                f"{request_id}:request-admission:scope-safe"
-                            ),
-                        }
-                        if len(safe_judged) > 1:
-                            safe_batch = await self.reference_judge.select_best(
-                                **safe_kwargs
-                            )
-                        else:
-                            safe_batch = await self.reference_judge.judge(**safe_kwargs)
-                        batches.append(safe_batch)
-                        selection_method = f"{selection_method}_scope_fallback"
-                        selected_candidate_id = getattr(
-                            safe_batch, "selected_candidate_id", None
-                        )
 
         decision_by_id: dict[str, EligibilityDecision] = {}
         for batch in batches:
@@ -917,8 +880,6 @@ class MemoryPipeline:
             decision = decision_by_id.get(candidate.candidate_id)
             if decision is None:
                 continue
-            if candidate.candidate_id in blocked_ids:
-                decision = self._scope_gate_decision(decision, candidate, question)
             decisions.append(decision)
         decision_tuple = tuple(decisions)
         decision_by_id = {
