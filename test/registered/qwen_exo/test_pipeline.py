@@ -1063,6 +1063,73 @@ def test_request_start_reviews_but_blocks_reflection_from_another_task(tmp_path)
     assert completed["judge_wave_count"] == 2
 
 
+def test_reflection_named_by_the_question_bypasses_the_task_scope_gate(tmp_path):
+    """A reflection the user names must be admitted across task scopes.
+
+    Reflection categories are per-task digests, so a direct question about a
+    past task never matched the current scope: the judge selected the right
+    memory and the scope gate then flipped it to ineligible, leaving the model
+    to answer that no such work had happened. Quoting a title segment is the
+    user asking for that memory.
+    """
+    repo = KnowledgeRepository(tmp_path / "reflection-named")
+    current_task = "帮我看看这个部署脚本为什么失败"
+    past_task = "system-reminder today 2026-09-02 整理 Obsidian 笔记资料"
+
+    def reflection(path, task, title, body):
+        repo.upsert(
+            path,
+            "---\nsource_kind: trajectory_reflection\n"
+            f"title: {title}\n"
+            "document_group: reflection_memory\nreflection_memory_schema: 3\n"
+            f"retrieval_category: {reflection_task_category(task)}\n---\n\n{body}",
+        )
+
+    reflection(
+        "reflection-memory/notes.md",
+        past_task,
+        "笔记资料整理：交付物观测与验收边界",
+        "交付物观测规则。",
+    )
+    reflection(
+        "reflection-memory/lint.md",
+        past_task,
+        "TS 规则提交前门禁误判：tsc 错误计数未闭环",
+        "门禁规则。",
+    )
+    notes = native_candidate(repo, "reflection-memory/notes.md", page_id=3, score=0.9)
+    lint = native_candidate(repo, "reflection-memory/lint.md", page_id=4, score=0.95)
+    judge = FakeReferenceJudge(winner_path="reflection-memory/notes.md")
+    telemetry = FakeTelemetry()
+    pipeline = build_pipeline(
+        config(tmp_path, policy_data=False),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=FakeQKTensorBank((lint, notes)),
+        reference_judge=judge,
+        telemetry=telemetry,
+    )
+    question = "在之前做笔记资料整理的时候 我们遇到什么问题了？"
+
+    _prepared, state = asyncio.run(
+        pipeline.prepare_responses_request(
+            FakeRequest(request_id="resp-named-memory", input=question),
+            original_task=current_task,
+            retrieval_question=question,
+            query_heads=(((1.0, 0.0),),),
+            query_states=query_states((((1.0, 0.0),),)),
+            query_probe_status="ready",
+        )
+    )
+
+    (proposed,) = telemetry.by_type("tensor.candidates_proposed")
+    assert proposed["task_scope_filtered_candidate_ids"] == [lint.candidate_id]
+    decisions = {decision.candidate_id: decision for decision in state.decisions}
+    assert decisions[notes.candidate_id].status is EligibilityStatus.ELIGIBLE
+    assert not decisions[notes.candidate_id].judge_method.endswith(":task_scope")
+    assert state.selected_document_ids == (notes.document_id,)
+
+
 def test_comparative_selector_can_choose_lower_qk_candidate(tmp_path):
     repo = repository(tmp_path)
     higher_qk = native_candidate(repo, "wfp.md", page_id=3, score=0.95)

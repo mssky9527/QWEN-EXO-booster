@@ -21,6 +21,7 @@ from qwen_exo_booster.knowledge import (
     KnowledgeCandidate,
     KnowledgeRepository,
     is_compatible_reflection_memory,
+    question_names_document,
     reflection_memory_matches_task,
     reflection_task_category,
     semantic_document_group,
@@ -506,7 +507,14 @@ class MemoryPipeline:
         self,
         candidates: tuple[KnowledgeCandidate, ...],
         original_task: str,
+        *,
+        question: str = "",
     ) -> tuple[tuple[str, str, str], ...]:
+        """Scope keys of reflections from another task, unless named outright.
+
+        A reflection the question names by title is what the user is asking
+        about; the cross-task gate is for implicit leakage only.
+        """
         filtered: list[tuple[str, str, str]] = []
         for candidate in candidates:
             if candidate.lane != "knowledge":
@@ -515,8 +523,13 @@ class MemoryPipeline:
                 document = self.repository.get(candidate.document_id)
             except KeyError:
                 continue
-            if not reflection_memory_matches_task(document, original_task):
-                filtered.append(self._candidate_scope_key(candidate))
+            if reflection_memory_matches_task(document, original_task):
+                continue
+            if question_names_document(question, document) or question_names_document(
+                original_task, document
+            ):
+                continue
+            filtered.append(self._candidate_scope_key(candidate))
         return tuple(filtered)
 
     def _filter_task_scoped_reflections(
@@ -1227,7 +1240,7 @@ class MemoryPipeline:
         )
         task_scope_exact_candidate_count = len(exact_task_candidates)
         task_scope_filtered_keys = self._task_scope_filtered_keys(
-            candidate_tuple, task_scope
+            candidate_tuple, task_scope, question=question
         )
         task_scope_filtered_key_set = frozenset(task_scope_filtered_keys)
         task_scope_filtered_candidates = tuple(

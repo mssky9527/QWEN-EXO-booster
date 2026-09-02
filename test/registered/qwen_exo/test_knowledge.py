@@ -1089,3 +1089,25 @@ def test_lexical_terms_index_cjk_runs_as_bigrams():
 
 def _is_cjk(term: str) -> bool:
     return all("\u4e00" <= character <= "\u9fff" for character in term)
+
+
+def test_question_names_document_requires_a_whole_title_segment():
+    """Naming a memory lifts the cross-task scope gate; topical overlap does not.
+
+    Live case: a question quoting "笔记资料整理" was blocked because the
+    reflection carried another task's category even though the judge picked
+    it. A single shared bigram must not count as naming the document.
+    """
+    from types import SimpleNamespace
+
+    from qwen_exo_booster.knowledge import question_names_document
+
+    notes = SimpleNamespace(title="笔记资料整理：交付物观测与验收边界")
+    lint = SimpleNamespace(title="TS 规则提交前门禁误判：tsc 错误计数未闭环")
+    latin = SimpleNamespace(title="Mashumaro flatten task contract")
+
+    assert question_names_document("在之前做笔记资料整理的时候 我们遇到什么问题了？", notes)
+    assert not question_names_document("在之前做笔记资料整理的时候 我们遇到什么问题了？", lint)
+    assert not question_names_document("整理一下今天的资料", notes)
+    assert question_names_document("what did the mashumaro flatten task contract say?", latin)
+    assert not question_names_document("", notes)

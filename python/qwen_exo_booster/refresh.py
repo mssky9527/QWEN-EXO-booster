@@ -22,6 +22,7 @@ from qwen_exo_booster.knowledge import (
     KnowledgeCandidate,
     KnowledgeRepository,
     is_compatible_reflection_memory,
+    question_names_document,
     reflection_memory_matches_task,
     reflection_task_category,
 )
@@ -385,6 +386,8 @@ class SelfAskRefreshService:
         self,
         candidates: tuple[KnowledgeCandidate, ...],
         original_task: str,
+        *,
+        question: str = "",
     ) -> tuple[tuple[str, str, str], ...]:
         filtered: list[tuple[str, str, str]] = []
         for candidate in candidates:
@@ -394,8 +397,13 @@ class SelfAskRefreshService:
                 document = self.repository.get(candidate.document_id)
             except KeyError:
                 continue
-            if not reflection_memory_matches_task(document, original_task):
-                filtered.append(self._candidate_scope_key(candidate))
+            if reflection_memory_matches_task(document, original_task):
+                continue
+            if question_names_document(question, document) or question_names_document(
+                original_task, document
+            ):
+                continue
+            filtered.append(self._candidate_scope_key(candidate))
         return tuple(filtered)
 
     def _filter_task_scoped_reflections(
@@ -627,7 +635,7 @@ class SelfAskRefreshService:
                 )
                 raw_proposed = (*raw_proposed, *exact_task_candidates)
                 task_scope_filtered_keys = self._task_scope_filtered_keys(
-                    tuple(raw_proposed), user_question
+                    tuple(raw_proposed), user_question, question=self_question
                 )
                 task_scope_filtered_key_set = frozenset(task_scope_filtered_keys)
                 task_scope_filtered_count = len(task_scope_filtered_keys)

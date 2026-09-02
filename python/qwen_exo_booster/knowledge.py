@@ -255,6 +255,27 @@ def reflection_task_category(original_task: str) -> str:
     return f"reflection-task-{slug + '-' if slug else ''}{digest}"
 
 
+_TITLE_SEGMENT_SPLIT = re.compile(r"[：:｜|—\-–,，、;；()（）\[\]【】/]+")
+
+
+def question_names_document(question: str, document: KnowledgeDocument) -> bool:
+    """True when the question quotes a whole segment of the document title.
+
+    The task-scope gate keeps task-specific reflections out of unrelated
+    tasks. A user who names the memory ("what went wrong when we organized the
+    notes?" against the title "笔记资料整理：交付物观测与验收边界") is asking
+    for it, so a verbatim title segment lifts the gate for that document.
+    """
+    question_terms = set(lexical_terms(question))
+    if not question_terms:
+        return False
+    for segment in _TITLE_SEGMENT_SPLIT.split(str(document.title or "")):
+        terms = lexical_terms(segment)
+        if len(terms) >= 2 and all(term in question_terms for term in terms):
+            return True
+    return False
+
+
 def reflection_memory_matches_task(
     document: KnowledgeDocument, original_task: str
 ) -> bool:
