@@ -34,6 +34,21 @@ QK_RECALL_PRESETS: dict[str, tuple[float, float]] = {
 }
 
 
+_QK_QUERY_POOLINGS = frozenset({"sentence", "windows"})
+
+
+def parse_qk_query_heads(value: object) -> tuple[int, ...]:
+    """Parse a comma-separated retrieval-head list into sorted unique ids."""
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)):
+        items = [str(item) for item in value]
+    else:
+        items = str(value).split(",")
+    heads = sorted({int(item.strip()) for item in items if item.strip()})
+    return tuple(heads)
+
+
 def qk_recall_gates(preset: str) -> tuple[float, float]:
     try:
         return QK_RECALL_PRESETS[str(preset)]
@@ -155,6 +170,9 @@ class QwenExoConfig:
     qk_prefilter_min_score: float | None = None
     qk_prefilter_min_margin: float | None = None
     qk_max_candidates_per_document: int = 1
+    qk_layer_id: int | None = None
+    qk_query_heads: tuple[int, ...] = ()
+    qk_query_pooling: str = "windows"
 
     @property
     def qk_admission_gates(self) -> tuple[float, float]:
@@ -390,6 +408,22 @@ class QwenExoConfig:
             raise ValueError("Q/K prefilter minimum margin must be non-negative")
         if self.qk_max_candidates_per_document < 1:
             raise ValueError("Q/K per-document candidate limit must be positive")
+        if self.qk_layer_id is not None and self.qk_layer_id < 0:
+            raise ValueError("Q/K layer id must be non-negative")
+        if any(head < 0 for head in self.qk_query_heads) or len(
+            set(self.qk_query_heads)
+        ) != len(self.qk_query_heads):
+            raise ValueError("Q/K query head ids must be unique and non-negative")
+        if self.qk_query_pooling not in _QK_QUERY_POOLINGS:
+            raise ValueError(
+                f"qk_query_pooling must be one of {sorted(_QK_QUERY_POOLINGS)}"
+            )
+        if self.backend == "mlx" and (
+            self.qk_layer_id is not None or self.qk_query_heads
+        ):
+            raise ValueError(
+                "Q/K layer and head selection are not supported on the MLX backend"
+            )
 
         if self.score_bias_mode != "off" and self.observer_mode == "off":
             raise ValueError("Score Bias requires an active or shadow observer")
@@ -564,6 +598,17 @@ class QwenExoConfig:
             ),
             qk_max_candidates_per_document=int(
                 getattr(server_args, "qwen_exo_qk_max_candidates_per_document", 1)
+            ),
+            qk_layer_id=(
+                None
+                if getattr(server_args, "qwen_exo_qk_layer", None) is None
+                else int(server_args.qwen_exo_qk_layer)
+            ),
+            qk_query_heads=parse_qk_query_heads(
+                getattr(server_args, "qwen_exo_qk_query_heads", None)
+            ),
+            qk_query_pooling=str(
+                getattr(server_args, "qwen_exo_qk_query_pooling", "windows")
             ),
             telemetry_include_text=bool(
                 getattr(server_args, "qwen_exo_telemetry_include_text", False)
@@ -782,6 +827,9 @@ class QwenExoConfig:
             "qk_prefilter_min_score": self.qk_prefilter_min_score,
             "qk_prefilter_min_margin": self.qk_prefilter_min_margin,
             "qk_max_candidates_per_document": self.qk_max_candidates_per_document,
+            "qk_layer_id": self.qk_layer_id,
+            "qk_query_heads": list(self.qk_query_heads),
+            "qk_query_pooling": self.qk_query_pooling,
             "observer_mode": self.observer_mode,
             "telemetry_include_text": self.telemetry_include_text,
             "context_evidence_mode": self.context_evidence_mode,

@@ -286,8 +286,13 @@ def load_page_key_heads(
     prefix_identity: str | None = None,
     token_count: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
+    layer_id: int | None = None,
 ) -> torch.Tensor:
-    """Load final-layer raw K heads from every TP rank without projection."""
+    """Load one full-attention layer's raw K heads from every TP rank.
+
+    Every full-attention layer's K is exported per page, so the recall layer
+    is a load-time choice. ``layer_id`` defaults to the final layer.
+    """
 
     rank_keys: list[torch.Tensor] = []
     expected_tokens: int | None = None
@@ -319,10 +324,16 @@ def load_page_key_heads(
             raise NativeStateBankError(
                 "native Bank artifact has no Full-Attention layers"
             )
-        final_layer = layers.get(str(layer_ids[-1]))
+        selected_layer = int(layer_ids[-1]) if layer_id is None else int(layer_id)
+        if selected_layer not in layer_ids:
+            raise NativeStateBankError(
+                f"native Bank artifact has no Full-Attention layer {selected_layer}; "
+                f"available layers: {list(layer_ids)}"
+            )
+        final_layer = layers.get(str(selected_layer))
         if not isinstance(final_layer, dict) or "key" not in final_layer:
             raise NativeStateBankError(
-                "native Bank artifact lacks its final-layer raw K"
+                f"native Bank artifact lacks raw K for layer {selected_layer}"
             )
         keys = _dequantize_fp8(final_layer["key"], dtype=dtype)
         if keys.ndim != 3 or not bool(torch.isfinite(keys.float()).all()):

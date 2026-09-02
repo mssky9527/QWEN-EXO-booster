@@ -893,3 +893,55 @@ def test_native_bank_restore_materializes_selected_kv_and_section_delta(tmp_path
     loaded_conv, loaded_temporal = mamba_pool.loaded[0]
     assert torch.allclose(loaded_conv[0].float(), conv, atol=0.14, rtol=0.08)
     assert torch.allclose(loaded_temporal.float(), temporal, atol=0.14, rtol=0.08)
+
+
+def test_load_page_key_heads_selects_the_configured_full_attention_layer(tmp_path):
+    """Every full-attention layer's K is exported; recall picks one at load.
+
+    Default stays the final layer (pre-existing behaviour). A configured layer
+    must be present in the artifact, otherwise loading fails closed instead of
+    silently falling back to another layer's geometry.
+    """
+    from qwen_exo_booster.native_state_bank import (
+        NativeStateBankError,
+        _atomic_torch_save,
+        _page_path,
+        _quantize_fp8,
+        load_page_key_heads,
+    )
+
+    root = tmp_path / "native-bank"
+    digest = "d" * 64
+    layer_keys = {
+        "3": torch.full((4, 1, 2), 1.0),
+        "7": torch.full((4, 1, 2), 7.0),
+    }
+    payload = {
+        "schema": "qwen-exo-native-state-bank-v1",
+        "source_digest": digest,
+        "page_id": 0,
+        "rank": 0,
+        "world_size": 1,
+        "model_fingerprint": "fp",
+        "prefix_identity": "p",
+        "capture_count": 4,
+        "token_ids": (1, 2, 3, 4),
+        "full_layer_ids": (3, 7),
+        "full_attention": {
+            layer: {"key": _quantize_fp8(keys, reduce_dims=(0, 2))}
+            for layer, keys in layer_keys.items()
+        },
+    }
+    _atomic_torch_save(payload, _page_path(root, digest, 0, 0))
+
+    final = load_page_key_heads(root, source_digest=digest, page_id=0, world_size=1)
+    middle = load_page_key_heads(
+        root, source_digest=digest, page_id=0, world_size=1, layer_id=3
+    )
+
+    assert torch.allclose(final.float(), torch.full((4, 1, 2), 7.0), atol=0.1)
+    assert torch.allclose(middle.float(), torch.full((4, 1, 2), 1.0), atol=0.02)
+    with pytest.raises(NativeStateBankError, match="layer 5"):
+        load_page_key_heads(
+            root, source_digest=digest, page_id=0, world_size=1, layer_id=5
+        )

@@ -130,9 +130,12 @@ class QueryProbeService:
         head_dim: int | None = None,
         timeout_seconds: float = 30.0,
         cache_size: int = 16,
+        query_pooling: str = "windows",
     ) -> None:
         if max_prompt_tokens < 1 or timeout_seconds <= 0 or cache_size < 1:
             raise ValueError("Query probe limits and cache size must be positive")
+        if query_pooling not in {"sentence", "windows"}:
+            raise ValueError("Query probe pooling must be sentence or windows")
         if len(cognition_token_ids) >= max_prompt_tokens:
             raise ValueError("Query probe Cognition prefix leaves no query capacity")
         if (query_head_count is None) != (head_dim is None) or (
@@ -151,6 +154,12 @@ class QueryProbeService:
         self.head_dim = int(head_dim) if head_dim is not None else None
         self.timeout_seconds = float(timeout_seconds)
         self.cache_size = int(cache_size)
+        # ``windows`` splits each anchor role into short token windows;
+        # ``sentence`` pools one query per role over the whole text (the model
+        # captures the mean Q over the span). With final-layer K, windows
+        # measured hit@1 0.86 vs 0.50 for sentence on reflection self-retrieval,
+        # so it stays the default; sentence is kept for retrieval-layer sweeps.
+        self.query_pooling = str(query_pooling)
         self._cache: OrderedDict[str, tuple[tuple[tuple[float, ...], ...], ...]] = (
             OrderedDict()
         )
@@ -227,6 +236,7 @@ class QueryProbeService:
             ),
             self.query_head_count,
             self.head_dim,
+            self.query_pooling,
         )
         async with self._cache_lock:
             cached_query_heads = self._cache.get(cache_key)
@@ -430,6 +440,8 @@ class QueryProbeService:
         if trajectory_states:
             state_counts["trajectory_compaction"] = trajectory_states
         remaining_states = _MAX_QUERY_STATES - sum(state_counts.values())
+        if self.query_pooling == "sentence":
+            remaining_states = 0
         while anchor_roles and remaining_states:
             progressed = False
             for role in anchor_roles:

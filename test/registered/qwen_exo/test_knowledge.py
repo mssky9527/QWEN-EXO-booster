@@ -1066,3 +1066,26 @@ tags: [reflection-memory]
     assert payload["merge_document_paths"] == [left.relative_path, right.relative_path]
     assert payload["removed_document_paths"] == [right.relative_path]
     assert payload["hot_updated"] is True
+
+
+def test_lexical_terms_index_cjk_runs_as_bigrams():
+    """Chinese clauses must share terms with the documents they name.
+
+    ``\\w+`` yielded one token for an entire Chinese clause, so the BM25
+    channel produced no score for a question that quoted a document title
+    verbatim. Bigrams over each CJK run make the phrase overlap visible while
+    Latin words keep whole-word matching.
+    """
+    from qwen_exo_booster.knowledge import lexical_terms
+
+    question = lexical_terms("在之前做笔记资料整理的时候 我们遇到什么问题了？")
+    title = lexical_terms("笔记资料整理：交付物观测与验收边界 pytest")
+
+    assert {"笔记", "记资", "资料", "料整", "整理"} <= set(question)
+    assert {"笔记", "记资", "资料", "料整", "整理"} <= set(title)
+    assert "pytest" in title
+    assert all(len(term) <= 2 or not _is_cjk(term) for term in question)
+
+
+def _is_cjk(term: str) -> bool:
+    return all("\u4e00" <= character <= "\u9fff" for character in term)

@@ -144,6 +144,7 @@ class AttentionSignalTracker:
         score_bias_anchor_bias: float = 0.0,
         score_bias_anchor_drift_threshold: float = 0.35,
         score_bias_anchor_max_blocks: int = 2,
+        capture_full_queries: bool = True,
     ):
         self.num_heads = int(num_heads)
         self.num_kv_heads = int(num_kv_heads)
@@ -156,6 +157,9 @@ class AttentionSignalTracker:
                 "Total Q head count cannot be smaller than the local count"
             )
         self.max_requests = int(max_requests)
+        # False when a dedicated probe tracker on another layer owns the full
+        # Q-head capture; the final-layer tracker then leaves that key alone.
+        self.capture_full_queries = bool(capture_full_queries)
         self.max_memory_anchors = int(max_memory_anchors)
         if sketch_dimensions < 1:
             raise ValueError("Q sketch dimensions must be positive")
@@ -911,7 +915,11 @@ class AttentionSignalTracker:
             )
             prefill_key_sketches = self._capture_prefill_keys(k, metadata, final_mask)
             user_query_sketches = self._capture_user_queries(q, metadata, final_mask)
-            full_user_queries = self._capture_full_user_queries(q, metadata, final_mask)
+            full_user_queries = (
+                self._capture_full_user_queries(q, metadata, final_mask)
+                if self.capture_full_queries
+                else None
+            )
             offset = 0
             for row, extend_len in enumerate(
                 metadata.extend_lens[: len(metadata.rids)]
@@ -1207,6 +1215,27 @@ class AttentionSignalTracker:
             stale, _queries = self._user_queries.popitem(last=False)
             self._trajectory_shortlists.pop(stale, None)
         return output
+
+    def capture_full_user_queries(
+        self,
+        q: torch.Tensor,
+        metadata: AttentionBatchMetadata,
+    ) -> dict[str, torch.Tensor] | None:
+        """Probe-only entry: mean-pooled full Q heads per query span.
+
+        Used by a tracker placed on the configured Q/K recall layer when that
+        layer is not the final full-attention layer. It performs none of the
+        observer or score-bias work of :meth:`observe`.
+        """
+        if not metadata.is_extend or not metadata.rids or not metadata.extend_lens:
+            return None
+        final_mask = metadata.final_prefill_mask or tuple(
+            metadata.contains_last_prefill_chunk for _ in metadata.rids
+        )
+        captured = self._capture_full_user_queries(q, metadata, final_mask)
+        if captured is None:
+            return None
+        return {"qwen_exo_user_query_full_heads": captured}
 
     def _capture_full_user_queries(
         self,

@@ -1380,6 +1380,8 @@ class QwenExoRuntime:
                             self.config.tensor_bank_surprisal_threshold
                         ),
                         span_tokens=self.config.tensor_bank_span_tokens,
+                        qk_layer_id=self.config.qk_layer_id,
+                        qk_query_heads=self.config.qk_query_heads,
                     )
                     self._stage_pre_complete_knowledge(tokenizer)
                     if self.memory_pipeline is not None:
@@ -1443,6 +1445,7 @@ class QwenExoRuntime:
                             cognition_token_ids=self.tensor_bank.cognition_token_ids(),
                             query_head_count=query_head_count,
                             head_dim=query_head_dim,
+                            query_pooling=self.config.qk_query_pooling,
                         )
                 if (
                     self.config.feature_flags.adaptive_refresh
@@ -1740,7 +1743,7 @@ class QwenExoRuntime:
 
     def _cognition_text(self) -> str | None:
         documents = tuple(self.cognition.snapshot.documents)
-        tokenizer = self.tokenizer_manager.tokenizer
+        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
         if not documents or tokenizer is None:
             return None
         document = documents[0]
@@ -7414,6 +7417,7 @@ class QwenExoRuntime:
                             self.tokenizer_manager
                         ),
                         cognition_token_ids=self.tensor_bank.cognition_token_ids(),
+                        query_pooling=self.config.qk_query_pooling,
                     )
                 if effective_category:
                     self.document_categories.ensure(
@@ -8213,6 +8217,100 @@ class QwenExoRuntime:
     async def reindex_tensor_bank(self) -> dict[str, Any]:
         async with self._tensor_bank_admin_lock:
             return await self._reindex_tensor_bank_unlocked()
+
+    async def preview_qk_rank(
+        self, question: str, *, limit: int = 8, pooling: str | None = None
+    ) -> dict[str, Any]:
+        """Probe ``question`` and rank the Tensor Bank as a user request would.
+
+        Admin-only evaluation surface: it runs the same query probe and
+        ``rank`` call (lexical fusion included) without a judge or any
+        attachment, and returns the audit so layer/head sweeps can measure
+        hit@k offline against a labelled question set.
+        """
+        text = str(question or "").strip()
+        if not text:
+            raise ValueError("question must not be empty")
+        if self.tensor_bank is None or self.query_probe is None:
+            raise RuntimeError("Q/K recall is unavailable on this runtime")
+        snapshot = await self.tensor_bank.ensure_ready()
+        if not snapshot.ready:
+            raise RuntimeError("Tensor Bank is not ready")
+        parent_id = "qk-rank-preview:" + stable_digest(text, str(time.time()))[:24]
+        query_probe = self.query_probe
+        if pooling is not None and pooling != query_probe.query_pooling:
+            query_probe = QueryProbeService(
+                self.internal_jobs,
+                query_probe.tokenizer,
+                self.telemetry,
+                max_prompt_tokens=query_probe.max_prompt_tokens,
+                cognition_token_ids=query_probe.cognition_token_ids,
+                query_head_count=query_probe.query_head_count,
+                head_dim=query_probe.head_dim,
+                timeout_seconds=query_probe.timeout_seconds,
+                query_pooling=pooling,
+            )
+        try:
+            probe = await query_probe.probe(
+                parent_id, QueryProbePlan.current_user(text)
+            )
+            if probe.status != "ready" or not probe.query_heads:
+                return {
+                    "question": text,
+                    "probe_status": probe.status,
+                    "candidates": [],
+                    "rank_audit": {},
+                }
+            min_tensor_score, rank_margin = self.config.qk_admission_gates
+            audit: dict[str, Any] = {}
+            candidates = self.tensor_bank.rank(
+                probe.query_heads,
+                query_states=probe.query_states,
+                query_identity=parent_id,
+                limit=max(1, int(limit)),
+                min_tensor_score=min_tensor_score,
+                min_document_margin=0.0,
+                audit=audit,
+                query_text=text,
+            )
+        finally:
+            await self.internal_jobs.finish_parent(parent_id)
+        return {
+            "question": text,
+            "probe_status": probe.status,
+            "probe_query_count": len(probe.query_heads),
+            "qk_layer_id": self.tensor_bank.qk_layer_id,
+            "qk_query_heads": list(self.tensor_bank.qk_query_heads),
+            "qk_query_pooling": query_probe.query_pooling,
+            "candidates": [
+                {
+                    "rank": index + 1,
+                    "lane": candidate.lane,
+                    "document_id": candidate.document_id,
+                    "relative_path": candidate.relative_path,
+                    "tensor_score": candidate.tensor_score,
+                    "relative_tensor_score": candidate.relative_tensor_score,
+                    "lexical_score": candidate.lexical_score,
+                    "head_group_count": candidate.head_group_count,
+                }
+                for index, candidate in enumerate(candidates)
+            ],
+            "rank_audit": {
+                key: value
+                for key, value in audit.items()
+                if key
+                in {
+                    "status",
+                    "reason",
+                    "considered_documents",
+                    "relative_score_active",
+                    "background_gate_active",
+                    "lexical_fusion",
+                    "query_count",
+                    "scored_documents",
+                }
+            },
+        }
 
     def status(self) -> dict[str, Any]:
         with self._session_initial_gdn_value_lock:

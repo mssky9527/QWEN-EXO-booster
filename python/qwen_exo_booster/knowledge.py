@@ -16,6 +16,9 @@ from qwen_exo_booster.contracts import stable_digest
 
 _MARKDOWN_SUFFIXES = frozenset({".md", ".markdown"})
 _TERM_PATTERN = re.compile(r"[\w]+", re.UNICODE)
+# Han, Hiragana/Katakana and Hangul runs carry no word boundaries, so a run is
+# indexed as overlapping character bigrams (single characters stay as-is).
+_CJK_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
 _YAML_FRONT_MATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", re.DOTALL)
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 
@@ -155,8 +158,24 @@ def normalize_markdown(text: str) -> str:
 
 
 def lexical_terms(text: str) -> tuple[str, ...]:
+    """Tokenize for BM25: word tokens, with CJK runs split into bigrams.
+
+    ``\\w+`` treats a whole Chinese clause as one token, so a question and a
+    document that share a phrase never shared a term and the lexical channel
+    was silent for Chinese content.
+    """
     normalized = normalize_markdown(str(text)).casefold()
-    return tuple(term for term in _TERM_PATTERN.findall(normalized) if len(term) > 1)
+    terms: list[str] = []
+    for token in _TERM_PATTERN.findall(normalized):
+        for piece in _CJK_RUN.split(token):
+            if len(piece) > 1:
+                terms.append(piece)
+        for run in _CJK_RUN.findall(token):
+            if len(run) == 1:
+                terms.append(run)
+            else:
+                terms.extend(run[index : index + 2] for index in range(len(run) - 1))
+    return tuple(terms)
 
 
 @dataclass(frozen=True, slots=True)

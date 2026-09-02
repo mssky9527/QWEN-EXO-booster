@@ -118,6 +118,12 @@ class ApiKeyDeleteRequest(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=1000)
 
 
+class QKRankPreviewRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=8192)
+    limit: int = Field(default=8, ge=1, le=64)
+    pooling: Literal["sentence", "windows"] | None = None
+
+
 def _api_key_store() -> ApiKeyStore:
     path = Path(os.getenv("QWEN_EXO_API_KEY_STORE", "/data/qwen-exo/api-keys.json"))
     return ApiKeyStore(path)
@@ -955,6 +961,20 @@ async def get_policy_data(relative_path: str, request: Request):
         return runtime.policy_data_document(relative_path)
     except KeyError:
         raise HTTPException(status_code=404, detail="未找到 PolicyData 文档")
+
+
+@router.post("/tensor-bank/rank-preview")
+async def preview_qk_rank(payload: QKRankPreviewRequest, request: Request):
+    """Run the query probe and Q/K ranking for one question (evaluation)."""
+    runtime = _runtime(request)
+    try:
+        return await runtime.preview_qk_rank(
+            payload.question, limit=payload.limit, pooling=payload.pooling
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.post("/knowledge/preview")

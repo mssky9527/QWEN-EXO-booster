@@ -3032,6 +3032,34 @@ class ServerArgs:
             "Judge shortlist; the best page is always kept first."
         ),
     ] = 1
+    qwen_exo_qk_layer: A[
+        Optional[int],
+        (
+            "Full-attention layer whose raw Q and K drive QWEN-EXO Q/K recall. "
+            "Defaults to the final full-attention layer. Must name a "
+            "full-attention layer of the served hybrid model; CUDA only."
+        ),
+    ] = None
+    qwen_exo_qk_query_heads: A[
+        Optional[str],
+        (
+            "Comma-separated query head ids restricted to Q/K recall scoring "
+            "(retrieval heads). Defaults to every head."
+        ),
+    ] = None
+    qwen_exo_qk_query_pooling: A[
+        str,
+        Arg(
+            help=(
+                "How the question is turned into attention queries for Q/K "
+                "recall: windows splits each role into short token windows "
+                "(default; measured best with final-layer K); sentence pools "
+                "one query per role over the whole text, for retrieval-layer "
+                "experiments."
+            ),
+            choices=["sentence", "windows"],
+        ),
+    ] = "windows"
     qwen_exo_console_trace_default_scope: A[
         str,
         Arg(

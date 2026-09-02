@@ -53,7 +53,10 @@ def test_judge_excerpt_decodes_only_salient_spans(tmp_path):
     assert "ctf/doc.md" in excerpt
     assert "flag{early}" in excerpt
     assert "flag{late}" in excerpt
-    assert "w100" not in excerpt
+    # The document head is shown before the spans; the body between the head
+    # and the salient spans stays out.
+    assert excerpt.index("[文档开头]") < excerpt.index("[显著片段摘录]")
+    assert "w195" not in excerpt
 
 
 def test_judge_excerpt_skips_cognition_prefix_and_caches(tmp_path):

@@ -1798,3 +1798,151 @@ async def test_judge_excerpt_leads_with_title_and_rule_card_head(tmp_path):
     assert excerpt.index("标题: 笔记资料整理：交付物观测") < excerpt.index("[文档开头]")
     assert excerpt.index("HEAD_RULE_CARD") < excerpt.index("[显著片段摘录]")
     assert excerpt.index("[显著片段摘录]") < excerpt.index("TAIL_SPAN.")
+
+
+@pytest.mark.asyncio
+async def test_documents_at_or_below_background_are_dropped_without_lexical_support(
+    tmp_path,
+):
+    """The per-query median across a populated bank is the negative baseline.
+
+    Every long document reaches a similar Q/K ceiling, so a fixed raw score
+    gate never fires. A document scoring at or below the median of all bank
+    documents carries no evidence above what an unrelated document scores; it
+    only stays in the shortlist when the question names it lexically.
+    """
+    root = tmp_path / "background"
+    root.mkdir()
+    (root / "target.md").write_text("target evidence " * 8, encoding="utf-8")
+    for index in range(8):
+        (root / f"noise-{index}.md").write_text(
+            f"noise document {index} " * 8, encoding="utf-8"
+        )
+    (root / "named.md").write_text("named fallback record " * 8, encoding="utf-8")
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    bank = TensorBank(
+        tmp_path / "background.pt",
+        _BankRunner(tmp_path / "native-bank"),
+        _BankTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint="model-fingerprint-background",
+        max_document_tokens=256,
+        salient_token_budget=128,
+    )
+    snapshot = await bank.ensure_ready()
+    raw_key_heads = []
+    for page, keys in zip(snapshot.pages, snapshot.raw_key_heads):
+        values = torch.zeros((keys.shape[0], 1, 2), dtype=torch.float32)
+        values[:, :, 0] = 1.0 if page.relative_path == "target.md" else 0.5
+        raw_key_heads.append(values)
+    bank._snapshot = replace(snapshot, raw_key_heads=tuple(raw_key_heads))
+    bank._rank_key_cache.clear()
+    query = (((1.0, 0.0),),)
+
+    audit = {}
+    gated = bank.rank(
+        query,
+        query_states=_query_states(1),
+        query_identity="background-gate",
+        limit=8,
+        min_document_margin=0.0,
+        audit=audit,
+    )
+    with_lexical = bank.rank(
+        query,
+        query_states=_query_states(1),
+        query_identity="background-gate-lexical",
+        limit=8,
+        min_document_margin=0.0,
+        query_text="the named fallback record",
+    )
+
+    assert audit["background_gate_active"] is True
+    assert [c.relative_path for c in gated] == ["target.md"]
+    assert [c.relative_path for c in with_lexical] == ["named.md", "target.md"]
+
+
+@pytest.mark.asyncio
+async def test_retrieval_head_subset_restricts_qk_scoring(tmp_path):
+    """Only configured retrieval heads may vote in the Q/K support score."""
+    root = tmp_path / "heads"
+    root.mkdir()
+    (root / "a.md").write_text("alpha document " * 8, encoding="utf-8")
+    (root / "b.md").write_text("beta document " * 8, encoding="utf-8")
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+
+    async def ranked_first(qk_query_heads):
+        bank = TensorBank(
+            tmp_path / f"heads-{'-'.join(map(str, qk_query_heads)) or 'all'}.pt",
+            _BankRunner(tmp_path / "native-bank"),
+            _BankTokenizer(),
+            {"knowledge": repository},
+            model_fingerprint="model-fingerprint-heads",
+            max_document_tokens=256,
+            salient_token_budget=128,
+            qk_query_heads=qk_query_heads,
+        )
+        snapshot = await bank.ensure_ready()
+        raw_key_heads = []
+        for page, keys in zip(snapshot.pages, snapshot.raw_key_heads):
+            values = torch.zeros((keys.shape[0], 1, 2), dtype=torch.float32)
+            # a.md matches query head 0; b.md matches query head 1 (stronger).
+            if page.relative_path == "a.md":
+                values[:, :, 0] = 1.0
+            else:
+                values[:, :, 1] = 2.0
+            raw_key_heads.append(values)
+        bank._snapshot = replace(snapshot, raw_key_heads=tuple(raw_key_heads))
+        bank._rank_key_cache.clear()
+        audit = {}
+        candidates = bank.rank(
+            (((1.0, 0.0), (0.0, 1.0)),),
+            query_states=_query_states(1),
+            query_identity="heads",
+            limit=2,
+            min_document_margin=0.0,
+            audit=audit,
+        )
+        return candidates[0].relative_path, audit["qk_query_heads"]
+
+    assert await ranked_first(()) == ("b.md", [])
+    assert await ranked_first((0,)) == ("a.md", [0])
+
+
+def test_probe_tracker_captures_full_queries_without_observer_work():
+    """A recall layer other than the final one gets a probe-only tracker.
+
+    It must return the same mean-pooled full Q heads that observe() returns
+    on the final layer, and the final-layer tracker configured with
+    capture_full_queries=False must leave the key alone so the two layers
+    never race on it.
+    """
+    metadata = AttentionBatchMetadata(
+        is_decode=False,
+        is_extend=True,
+        contains_last_prefill_chunk=True,
+        rids=("probe",),
+        observe_mask=(True,),
+        memory_spans=(None,),
+        user_query_spans=(((0, 2),),),
+        full_query_capture=(True,),
+        final_prefill_mask=(True,),
+        extend_lens=(2,),
+        prefix_lens=(0,),
+    )
+    q = torch.tensor([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]])
+    keys = torch.zeros((2, 1, 2))
+
+    probe_tracker = AttentionSignalTracker(num_heads=2, num_kv_heads=1, head_dim=2)
+    probe_result = probe_tracker.capture_full_user_queries(q, metadata)
+    final_tracker = AttentionSignalTracker(
+        num_heads=2, num_kv_heads=1, head_dim=2, capture_full_queries=False
+    )
+    final_result = final_tracker.observe(q, keys, metadata)
+
+    assert probe_result is not None
+    expected = torch.tensor([[3.0, 4.0], [5.0, 6.0]])
+    assert torch.equal(probe_result["qwen_exo_user_query_full_heads"][0, 0], expected)
+    assert "qwen_exo_user_query_full_heads" not in (final_result or {})

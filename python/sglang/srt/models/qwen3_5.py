@@ -806,6 +806,29 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and bool(attention_layer_ids)
             and layer_id == attention_layer_ids[-1]
         )
+        # Q/K recall may read Q from a non-final full-attention layer. That
+        # layer gets a probe-only tracker; the final-layer tracker then skips
+        # the full Q-head capture so the two never write the same key.
+        qwen_exo_qk_layer = getattr(server_args, "qwen_exo_qk_layer", None)
+        if qwen_exo_qk_layer is not None and bool(attention_layer_ids):
+            qwen_exo_qk_layer = int(qwen_exo_qk_layer)
+            if qwen_exo_qk_layer not in attention_layer_ids:
+                raise ValueError(
+                    f"--qwen-exo-qk-layer {qwen_exo_qk_layer} is not a full-attention "
+                    f"layer of this model; choose one of {attention_layer_ids}"
+                )
+        qwen_exo_probe_layer = (
+            bool(getattr(server_args, "enable_qwen_exo", False))
+            and qwen_exo_qk_layer is not None
+            and bool(attention_layer_ids)
+            and qwen_exo_qk_layer != attention_layer_ids[-1]
+            and layer_id == qwen_exo_qk_layer
+        )
+        final_layer_captures_full_queries = (
+            qwen_exo_qk_layer is None
+            or not attention_layer_ids
+            or qwen_exo_qk_layer == attention_layer_ids[-1]
+        )
         self.qwen_exo_score_bias_enabled = (
             bool(getattr(server_args, "enable_qwen_exo", False))
             and getattr(server_args, "qwen_exo_score_bias_mode", "off") != "off"
@@ -857,8 +880,21 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 score_bias_anchor_drift_threshold=float(
                     getattr(server_args, "qwen_exo_observer_q_drift_threshold", 0.35)
                 ),
+                capture_full_queries=final_layer_captures_full_queries,
             )
             if qwen_exo_observer_enabled
+            else None
+        )
+        self.qwen_exo_probe_tracker = (
+            AttentionSignalTracker(
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                reduce_across_tp=reduce_across_tp,
+                total_num_heads=self.total_num_heads,
+                gather_heads_across_tp=gather_heads_across_tp,
+            )
+            if qwen_exo_probe_layer
             else None
         )
 
@@ -1333,6 +1369,56 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             return None, None
         return qwen_exo_block_bias_score_mod, [aux]
 
+    def _capture_qwen_exo_probe_queries(
+        self,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Capture query-probe Q heads on the configured Q/K recall layer."""
+        tracker = self.qwen_exo_probe_tracker
+        if tracker is None:
+            return
+        if get_is_capture_mode() or not forward_batch.forward_mode.is_extend():
+            return
+        capture_rows = tuple(forward_batch.qwen_exo_full_query_capture or ())
+        if not any(capture_rows):
+            return
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        metadata = AttentionBatchMetadata(
+            is_decode=False,
+            is_extend=True,
+            contains_last_prefill_chunk=forward_batch.contains_last_prefill_chunk,
+            rids=tuple(str(value) for value in (forward_batch.rids or ())),
+            observe_mask=tuple(forward_batch.qwen_exo_observe or ()),
+            final_prefill_mask=(
+                tuple(forward_batch.qwen_exo_final_prefill)
+                if forward_batch.qwen_exo_final_prefill is not None
+                else None
+            ),
+            user_query_spans=tuple(forward_batch.qwen_exo_user_query_spans or ()),
+            full_query_capture=capture_rows,
+            extend_lens=(
+                tuple(int(value) for value in extend_lens)
+                if extend_lens is not None
+                else None
+            ),
+            prefix_lens=(
+                tuple(int(value) for value in prefix_lens)
+                if prefix_lens is not None
+                else None
+            ),
+        )
+        customized_info = tracker.capture_full_user_queries(
+            self._qwen_exo_inverse_rope(q, positions), metadata
+        )
+        if customized_info is not None:
+            forward_batch.qwen_exo_customized_info = {
+                **(getattr(forward_batch, "qwen_exo_customized_info", None) or {}),
+                **customized_info,
+            }
+
     def _observe_qwen_exo_attention(
         self,
         q: torch.Tensor,
@@ -1478,6 +1564,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
 
         self._observe_qwen_exo_attention(q, k, positions, forward_batch)
+        self._capture_qwen_exo_probe_queries(q, positions, forward_batch)
         score_mod, score_bias_aux = self._qwen_exo_score_bias_attention(
             q, forward_batch
         )

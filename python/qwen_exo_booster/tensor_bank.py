@@ -108,6 +108,9 @@ _REFLECTION_TEMPLATE_MARKERS = (
 _RRF_K = 10
 # Rule-card head shown to the judge before the salient spans.
 _JUDGE_EXCERPT_HEAD_TOKENS = 192
+# The per-query median across documents is only a meaningful background
+# estimate once the bank holds this many documents.
+_RELATIVE_GATE_MIN_DOCUMENTS = 8
 _MIN_TENSOR_SCORE = 0.0
 _MIN_DOCUMENT_MARGIN = 0.005
 _SINK_TOKEN_TEXT = frozenset(
@@ -327,6 +330,8 @@ class TensorBank:
         span_tokens: int = 16,
         timeout_seconds: float = 120.0,
         tp_size: int | None = None,
+        qk_layer_id: int | None = None,
+        qk_query_heads: tuple[int, ...] = (),
     ):
         if max_document_tokens < _NATIVE_PREFIX_ALIGNMENT:
             raise ValueError("Tensor Bank document limit must hold one radix page")
@@ -363,6 +368,11 @@ class TensorBank:
         self.span_tokens = int(span_tokens)
         self.timeout_seconds = float(timeout_seconds)
         self.tp_size = int(tp_size) if tp_size is not None else None
+        # Recall layer and retrieval-head subset. Q comes from the same layer
+        # via the probe capture; both default to the final full-attention layer
+        # and every head, which is the pre-existing behaviour.
+        self.qk_layer_id = int(qk_layer_id) if qk_layer_id is not None else None
+        self.qk_query_heads = tuple(sorted({int(head) for head in qk_query_heads}))
         self._snapshot = self._empty_snapshot()
         self._refresh_lock = asyncio.Lock()
         self._resident_page_ids: set[int] = set()
@@ -758,6 +768,7 @@ class TensorBank:
                     prefix_identity=str(descriptor["page_identity"]),
                     token_count=int(descriptor["capture_count"]),
                     dtype=torch.float32,
+                    layer_id=self.qk_layer_id,
                 )
                 for descriptor in descriptors
             )
@@ -1327,6 +1338,9 @@ class TensorBank:
         fusion_rank = self._fused_rank(
             effective_relative_scores, lexical_scores
         )
+        background_gate = (
+            len(effective_relative_scores) >= _RELATIVE_GATE_MIN_DOCUMENTS
+        )
         if fusion_rank:
             ranked_by_score.sort(key=lambda item: fusion_rank[item[0]])
         ranked_documents = self._diversify_ranked_documents(list(ranked_by_score))
@@ -1454,6 +1468,9 @@ class TensorBank:
             "relative_runner_up_score": relative_runner_up_score,
             "relative_observed_margin": relative_observed_margin,
             "relative_score_active": bool(fusion_rank),
+            "background_gate_active": background_gate,
+            "qk_layer_id": self.qk_layer_id,
+            "qk_query_heads": list(self.qk_query_heads),
             "lexical_fusion": (
                 {
                     "method": "reciprocal_rank_fusion",
@@ -1500,6 +1517,15 @@ class TensorBank:
                 break
             tensor_score = effective_document_scores[(lane, document_id)]
             if tensor_score < float(min_tensor_score):
+                continue
+            # Negative baseline: the per-query median over every bank document
+            # is what an unrelated document scores. A document at or below it
+            # with no lexical support carries no evidence above background.
+            if (
+                background_gate
+                and effective_relative_scores[(lane, document_id)] <= 0.0
+                and lexical_scores.get((lane, document_id), 0.0) <= 0.0
+            ):
                 continue
             repository = self.repositories.get(lane)
             if repository is None:
@@ -1747,7 +1773,17 @@ class TensorBank:
             "qkrd,tkd->qtkr", query_groups, raw_key_heads
         ) / math.sqrt(int(queries.shape[2]))
         flattened_heads = head_logits.flatten(start_dim=2)
-        head_top_r = min(_HEAD_SCORE_TOP_R, int(flattened_heads.shape[2]))
+        head_count = int(flattened_heads.shape[2])
+        selected_heads = tuple(
+            head for head in self.qk_query_heads if 0 <= head < head_count
+        )
+        if selected_heads:
+            keep = torch.zeros(head_count, dtype=torch.bool, device=queries.device)
+            keep[list(selected_heads)] = True
+            flattened_heads = flattened_heads.masked_fill(~keep, float("-inf"))
+            head_top_r = min(_HEAD_SCORE_TOP_R, len(selected_heads))
+        else:
+            head_top_r = min(_HEAD_SCORE_TOP_R, head_count)
         head_top = torch.topk(
             flattened_heads,
             k=head_top_r,
@@ -2307,6 +2343,7 @@ class TensorBank:
                     prefix_identity=page.prefix_identity,
                     token_count=len(state_ids),
                     dtype=torch.float32,
+                    layer_id=self.qk_layer_id,
                 )
                 if int(keys.shape[0]) != len(state_ids):
                     return None

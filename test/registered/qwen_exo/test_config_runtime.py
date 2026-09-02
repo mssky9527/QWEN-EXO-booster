@@ -80,6 +80,41 @@ def test_experimental_activation_training_defaults_off_and_is_public(tmp_path):
     assert enabled.public_dict()["features"]["activation_training"] is True
 
 
+def test_qk_layer_and_head_selection_are_parsed_validated_and_public(tmp_path):
+    """Layer/head selection defaults to legacy behaviour and rejects MLX.
+
+    The MLX backend captures probe Q on its final layer only, so a configured
+    recall layer would pair Q and K from different layers; it fails at config
+    time instead of silently ranking against mismatched geometry.
+    """
+    default = QwenExoConfig.from_server_args(server_args(tmp_path))
+    assert default.qk_layer_id is None
+    assert default.qk_query_heads == ()
+    assert default.qk_query_pooling == "windows"
+
+    tuned = QwenExoConfig.from_server_args(
+        server_args(
+            tmp_path,
+            qwen_exo_qk_layer=35,
+            qwen_exo_qk_query_heads="7, 3,7,11",
+            qwen_exo_qk_query_pooling="sentence",
+        )
+    )
+    assert tuned.qk_layer_id == 35
+    assert tuned.qk_query_heads == (3, 7, 11)
+    assert tuned.public_dict()["qk_query_heads"] == [3, 7, 11]
+    assert tuned.public_dict()["qk_layer_id"] == 35
+
+    with pytest.raises(ValueError, match="qk_query_pooling"):
+        QwenExoConfig.from_server_args(
+            server_args(tmp_path, qwen_exo_qk_query_pooling="tokens")
+        )
+    with pytest.raises(ValueError, match="MLX"):
+        QwenExoConfig.from_server_args(
+            server_args(tmp_path, qwen_exo_backend="mlx", qwen_exo_qk_layer=35)
+        )
+
+
 def test_experimental_context_integrity_defaults_off_and_can_be_enabled(tmp_path):
     disabled = QwenExoConfig.from_server_args(
         server_args(tmp_path, qwen_exo_context_integrity_mode="active")

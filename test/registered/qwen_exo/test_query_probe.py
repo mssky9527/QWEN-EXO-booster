@@ -122,7 +122,9 @@ class FakeQKBank:
         min_tensor_score=0.0,
         min_document_margin=0.005,
         audit=None,
+        query_text=None,
     ):
+        del query_text
         self.rank_calls.append(
             (query_heads, query_states, query_identity, limit, min_document_margin)
         )
@@ -206,6 +208,7 @@ def test_query_probe_returns_finite_raw_q_heads_from_hidden_job():
         max_prompt_tokens=4,
         query_head_count=2,
         head_dim=2,
+        query_pooling="windows",
     )
 
     result = asyncio.run(
@@ -299,6 +302,7 @@ def test_query_probe_conditions_q_spans_on_cognition_prefix():
         cognition_token_ids=(90, 91),
         query_head_count=2,
         head_dim=2,
+        query_pooling="windows",
     )
 
     result = asyncio.run(
@@ -329,6 +333,7 @@ def test_query_probe_preserves_anchor_roles_and_bounds_trajectory():
         max_prompt_tokens=8,
         query_head_count=2,
         head_dim=2,
+        query_pooling="windows",
     )
     plan = QueryProbePlan(
         (
@@ -663,3 +668,42 @@ def test_request_memory_uses_only_query_q_and_skips_text_rankers(tmp_path):
     )
     assert changed_state.qk_rank_cache_hit is False
     assert len(bank.rank_calls) == 2
+
+
+def test_sentence_pooling_emits_one_whole_text_query_per_anchor_role():
+    """Sentence pooling gives each anchor role one span over its whole text.
+
+    The captured Q is the mean over the span, so a single span per role yields
+    a sentence-level query for retrieval-layer experiments; trajectory history
+    keeps its bounded two spans.
+    """
+    runner = FakeProbeRunner()
+    probe = QueryProbeService(
+        runner,
+        FakeTokenizer(),
+        FakeTelemetry(),
+        max_prompt_tokens=16,
+        query_head_count=2,
+        head_dim=2,
+        query_pooling="sentence",
+    )
+    plan = QueryProbePlan(
+        (
+            QueryRoleText("original_task", "one two three four"),
+            QueryRoleText("current_user", "five six seven"),
+            QueryRoleText("trajectory_compaction", " ".join(["history"] * 20)),
+        )
+    )
+
+    result = asyncio.run(probe.probe("resp-sentence", plan))
+
+    by_role = {}
+    for state in result.query_states:
+        by_role.setdefault(state.role, []).append(state)
+    assert len(by_role["original_task"]) == 1
+    assert len(by_role["current_user"]) == 1
+    (task,) = by_role["original_task"]
+    assert task.prompt_end - task.prompt_start == 4
+    (current,) = by_role["current_user"]
+    assert current.prompt_end - current.prompt_start == 3
+    assert len(by_role.get("trajectory_compaction", ())) <= 2
