@@ -483,3 +483,63 @@ def test_global_admission_honors_waiting_job_deadline():
     asyncio.run(exercise())
 
     assert len(manager.requests) == 1
+
+
+def test_single_job_probe_is_admitted_while_a_sibling_job_runs():
+    """A job's max_fanout bounds its batch, not the parent's concurrency.
+
+    The mid-think query probe (one job, max_fanout=1) was rejected with
+    "Parent already owns the maximum child fanout" whenever the concurrent
+    self-ask job of the same request was still running, so mid-think recall
+    silently returned no candidates. The parent's concurrent children are
+    bounded by the runner fanout; each batch is bounded by its own contract.
+    """
+    release = asyncio.Event()
+
+    class BlockingTokenizerManager(FakeTokenizerManager):
+        async def generate_request(self, request, raw_request):
+            self.requests.append(request)
+            if request.rid == ["self-ask"]:
+                await release.wait()
+                yield [{"text": "answer", "meta_info": {"completion_tokens": 4}}]
+            else:
+                yield [{"text": "probe", "meta_info": {"completion_tokens": 1}}]
+
+    manager = BlockingTokenizerManager()
+    runner = InternalJobRunner(
+        manager, max_fanout=4, max_tokens_per_parent=256, request_factory=request_factory
+    )
+
+    async def exercise():
+        self_ask = asyncio.create_task(
+            runner.run_batch(
+                [job(job_id="self-ask", token_budget=64, max_fanout=1)],
+                ["self ask"],
+                {"temperature": 0},
+            )
+        )
+        await asyncio.sleep(0)
+        probe = await runner.run_batch(
+            [
+                job(
+                    job_id="probe",
+                    job_type=InternalJobType.QUERY_PROBE,
+                    token_budget=1,
+                    max_fanout=1,
+                )
+            ],
+            ["probe"],
+            {"temperature": 0},
+        )
+        release.set()
+        await self_ask
+        with pytest.raises(ContractViolation, match="fanout"):
+            await runner.run_batch(
+                [job(index=i, max_fanout=2) for i in range(3)],
+                ["a", "b", "c"],
+                {"temperature": 0},
+            )
+        return probe
+
+    (result,) = asyncio.run(exercise())
+    assert result.text == "probe"

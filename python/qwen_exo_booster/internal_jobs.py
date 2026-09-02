@@ -401,8 +401,12 @@ class InternalJobRunner:
                         "Internal job was cancelled while awaiting global admission"
                     )
             active = self._active.setdefault(parent_request_id, set())
-            allowed_fanout = min(self.max_fanout, *(job.max_fanout for job in jobs))
-            if len(active) + len(jobs) > allowed_fanout:
+            # A job's ``max_fanout`` bounds its own batch (checked before
+            # reservation); the parent's concurrent children are bounded by the
+            # runner-wide fanout. Bounding the parent by the smallest child's
+            # batch fanout rejected every single-job probe while a sibling
+            # self-ask job was in flight.
+            if len(active) + len(jobs) > self.max_fanout:
                 raise ContractViolation("Parent already owns the maximum child fanout")
             duplicate = active.intersection(job.job_id for job in jobs)
             if duplicate:

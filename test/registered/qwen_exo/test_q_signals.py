@@ -1629,3 +1629,172 @@ async def test_sparse_negative_window_fails_closed_instead_of_zero_filling(tmp_p
 
     assert candidates == ()
     assert audit == {"status": "rejected", "reason": "no_finite_document_scores"}
+
+
+@pytest.mark.asyncio
+async def test_lexical_rank_fusion_lifts_exact_title_match_over_qk_noise(tmp_path):
+    """A document named by the question must not lose to a Q/K noise winner.
+
+    Raw final-layer Q/K support saturates at a similar ceiling for every long
+    document, so in production a request about the note-organizing task ranked
+    an unrelated lint-gate reflection first and every candidate within 0.5 of
+    each other. Fusing the standardized Q/K order with a BM25 order over the
+    same documents lets the exact term match decide, while documents without
+    lexical overlap keep their Q/K order and the raw tensor score is untouched.
+    """
+    root = tmp_path / "fusion"
+    root.mkdir()
+    (root / "notes.md").write_text(
+        "---\ntitle: notes organizing pitfalls\n---\n"
+        "notes organizing delivery observation " * 6,
+        encoding="utf-8",
+    )
+    (root / "lint.md").write_text(
+        "---\ntitle: lint gate misjudged\n---\n" + "lint gate tsc count " * 6,
+        encoding="utf-8",
+    )
+    (root / "ctf.md").write_text(
+        "---\ntitle: ctf probing\n---\n" + "ctf target payload probe " * 6,
+        encoding="utf-8",
+    )
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    bank = TensorBank(
+        tmp_path / "fusion.pt",
+        _BankRunner(tmp_path / "native-bank"),
+        _BankTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint="model-fingerprint-fusion",
+        max_document_tokens=512,
+        salient_token_budget=128,
+    )
+    snapshot = await bank.ensure_ready()
+    # Q/K: lint > ctf > notes, all within noise of each other.
+    qk_bias = {"lint.md": 1.0, "ctf.md": 0.98, "notes.md": 0.96}
+    raw_key_heads = []
+    for page, keys in zip(snapshot.pages, snapshot.raw_key_heads):
+        values = torch.zeros((keys.shape[0], 1, 2), dtype=torch.float32)
+        values[:, :, 0] = qk_bias[page.relative_path]
+        raw_key_heads.append(values)
+    bank._snapshot = replace(snapshot, raw_key_heads=tuple(raw_key_heads))
+    bank._rank_key_cache.clear()
+    query = (((1.0, 0.0),),)
+
+    without_text = bank.rank(
+        query,
+        query_states=_query_states(1),
+        query_identity="fusion-qk-only",
+        limit=3,
+        min_document_margin=0.0,
+    )
+    audit = {}
+    fused = bank.rank(
+        query,
+        query_states=_query_states(1),
+        query_identity="fusion-lexical",
+        limit=3,
+        min_document_margin=0.0,
+        audit=audit,
+        query_text="what went wrong while organizing notes?",
+    )
+
+    assert [c.relative_path for c in without_text] == ["lint.md", "ctf.md", "notes.md"]
+    assert [c.relative_path for c in fused] == ["notes.md", "lint.md", "ctf.md"]
+    assert fused[0].lexical_score > 0 and fused[1].lexical_score == 0.0
+    # Raw tensor scores are reported unchanged; only the order is fused.
+    assert fused[0].tensor_score == without_text[2].tensor_score
+    assert audit["relative_score_active"] is True
+    assert audit["lexical_fusion"]["lexical_document_count"] == 1
+    by_path = {row["relative_path"]: row for row in audit["scored_documents"]}
+    assert by_path["notes.md"]["fused_rank"] == 1
+    assert by_path["notes.md"]["lexical_score"] > 0
+
+
+@pytest.mark.asyncio
+async def test_rule_card_field_labels_are_not_searchable(tmp_path):
+    """Shared rule-card labels sit at the same offsets in every reflection.
+
+    In production the best window of a dozen unrelated reflections landed on
+    the same trigger/action/stop-signal labels, giving every document the same
+    ceiling score. The labels are template, not evidence.
+    """
+    root = tmp_path / "rule-card"
+    root.mkdir()
+    (root / "reflection.md").write_text(
+        "---\nsource_kind: trajectory_reflection\n"
+        "reflection_memory_schema: 3\ndocument_group: reflection_memory\n---\n"
+        "可执行规则（先读）:\n触发：在笔记库整理资料时。动作：核对来源。"
+        "停止信号：连续两次失败。适用范围：Obsidian 笔记库。",
+        encoding="utf-8",
+    )
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    bank = TensorBank(
+        tmp_path / "rule-card.pt",
+        _BankRunner(tmp_path / "native-bank"),
+        _BankTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint="rule-card",
+        max_document_tokens=256,
+        salient_token_budget=128,
+    )
+    snapshot = await bank.ensure_ready()
+    (page,) = snapshot.pages
+    mask = bank._token_search_mask(page, int(snapshot.raw_key_heads[0].shape[0]))
+    document_ids = bank._page_document_token_ids(page)
+
+    for label in ("触发：", "动作：", "停止信号：", "适用范围："):
+        positions = bank._subsequence_positions(
+            document_ids, tuple(bank.tokenizer.encode(label))
+        )
+        assert positions, label
+        assert all(not bool(mask[p].item()) for p in positions), label
+    evidence = bank._subsequence_positions(
+        document_ids, tuple(bank.tokenizer.encode("Obsidian"))
+    )
+    assert evidence and all(bool(mask[p].item()) for p in evidence)
+
+
+@pytest.mark.asyncio
+async def test_judge_excerpt_leads_with_title_and_rule_card_head(tmp_path):
+    """The judge rejected the right document when shown only Q/K spans.
+
+    The salient spans are chosen by the same noisy signal that ranked the
+    document, so on their own they rarely say what the document is about. The
+    excerpt now opens with the title and the rule-card head, and the spans
+    follow.
+    """
+    root = tmp_path / "excerpt"
+    root.mkdir()
+    (root / "notes.md").write_text(
+        "---\ntitle: 笔记资料整理：交付物观测\n---\n"
+        "HEAD_RULE_CARD first sentence. " + "filler body text " * 20 + "TAIL_SPAN.",
+        encoding="utf-8",
+    )
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    bank = TensorBank(
+        tmp_path / "excerpt.pt",
+        _BankRunner(tmp_path / "native-bank"),
+        _BankTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint="excerpt",
+        max_document_tokens=512,
+        salient_token_budget=128,
+    )
+    snapshot = await bank.ensure_ready()
+    (page,) = snapshot.pages
+    document = repository.snapshot.documents[0]
+    candidate = repository.candidate_for_document(document.document_id, "q")
+    raw_ids = bank.tokenizer.encode(candidate.reference_content)
+    tail_start = len(raw_ids) - len("TAIL_SPAN.")
+    salient = tuple(
+        page.cognition_token_count + p for p in range(tail_start, len(raw_ids))
+    )
+
+    excerpt = bank._judge_excerpt(candidate, replace(page, salient_positions=salient))
+
+    assert excerpt is not None
+    assert excerpt.index("标题: 笔记资料整理：交付物观测") < excerpt.index("[文档开头]")
+    assert excerpt.index("HEAD_RULE_CARD") < excerpt.index("[显著片段摘录]")
+    assert excerpt.index("[显著片段摘录]") < excerpt.index("TAIL_SPAN.")

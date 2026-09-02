@@ -91,7 +91,23 @@ _REFLECTION_TEMPLATE_MARKERS = (
     "冲突与适用边界:",
     "应避免的做法:",
     "下一次建议:",
+    # Rule-card field labels shared by every reflection memory. Their tokens
+    # sit at the same offsets in every document and produce identical
+    # high-scoring windows, so they must not count as searchable evidence.
+    "触发：",
+    "动作：",
+    "停止信号：",
+    "适用范围：",
+    "触发:",
+    "动作:",
+    "停止信号:",
+    "适用范围:",
 )
+# Reciprocal-rank-fusion constant. Small enough that a top lexical hit can
+# lift a document past raw Q/K neighbours that differ by noise only.
+_RRF_K = 10
+# Rule-card head shown to the judge before the salient spans.
+_JUDGE_EXCERPT_HEAD_TOKENS = 192
 _MIN_TENSOR_SCORE = 0.0
 _MIN_DOCUMENT_MARGIN = 0.005
 _SINK_TOKEN_TEXT = frozenset(
@@ -1089,7 +1105,18 @@ class TensorBank:
         min_document_margin: float = _MIN_DOCUMENT_MARGIN,
         audit: dict[str, Any] | None = None,
         eligible_documents: frozenset[tuple[str, str]] | None = None,
+        query_text: str | None = None,
     ) -> tuple[KnowledgeCandidate, ...]:
+        """Rank bank documents for the probed attention queries.
+
+        Raw Q/K support from the final full-attention layer is a weak, noisy
+        signal: every long document reaches a similar ceiling through its best
+        window. When ``query_text`` is given, the per-query standardized Q/K
+        rank is fused with a BM25 rank over the same documents (reciprocal rank
+        fusion), so exact term matches on titles and rule cards decide the
+        shortlist while Q/K still orders documents without lexical overlap.
+        """
+
         def record_audit(**values: Any) -> None:
             if audit is not None:
                 audit.clear()
@@ -1296,6 +1323,12 @@ class TensorBank:
             representative_by_group[group_key]: relative_group_scores[group_key]
             for group_key in grouped_documents
         }
+        lexical_scores = self._lexical_scores(query_text, effective_document_scores)
+        fusion_rank = self._fused_rank(
+            effective_relative_scores, lexical_scores
+        )
+        if fusion_rank:
+            ranked_by_score.sort(key=lambda item: fusion_rank[item[0]])
         ranked_documents = self._diversify_ranked_documents(list(ranked_by_score))
         pre_diversity_rank = {
             key: index + 1 for index, (key, _pages) in enumerate(ranked_by_score)
@@ -1371,6 +1404,8 @@ class TensorBank:
                     "representative_raw_tensor_score": document_scores[key],
                     "relative_tensor_score": effective_relative_scores[key],
                     "score_percentile": relative_percentiles[key],
+                    "lexical_score": lexical_scores.get(key, 0.0),
+                    "fused_rank": fusion_rank.get(key),
                     "semantic_group": semantic_group,
                     "semantic_group_member_count": len(grouped_documents[group_key]),
                     "diversity_bucket": diversity_bucket,
@@ -1418,7 +1453,17 @@ class TensorBank:
             "relative_top_score": relative_top_score,
             "relative_runner_up_score": relative_runner_up_score,
             "relative_observed_margin": relative_observed_margin,
-            "relative_score_active": False,
+            "relative_score_active": bool(fusion_rank),
+            "lexical_fusion": (
+                {
+                    "method": "reciprocal_rank_fusion",
+                    "rrf_k": _RRF_K,
+                    "qk_rank_signal": "relative_tensor_score",
+                    "lexical_document_count": len(lexical_scores),
+                }
+                if fusion_rank
+                else None
+            ),
             "considered_documents": len(ranked_documents),
             "scored_documents": scored_documents[: max(limit * 2, 8)],
             "document_scope_size": (
@@ -1524,7 +1569,7 @@ class TensorBank:
                 replace(
                     candidate,
                     score=tensor_score + candidate.quality_prior,
-                    lexical_score=0.0,
+                    lexical_score=lexical_scores.get((lane, document_id), 0.0),
                     tensor_score=tensor_score,
                     relative_tensor_score=effective_relative_scores[
                         (lane, document_id)
@@ -1555,12 +1600,60 @@ class TensorBank:
         )
         return tuple(candidates)
 
-    def _judge_excerpt(self, candidate: Any, page: TensorBankPage) -> str | None:
-        """Decode the page's salient spans into a bounded judge reference.
+    def _lexical_scores(
+        self,
+        query_text: str | None,
+        documents: dict[tuple[str, str], float],
+    ) -> dict[tuple[str, str], float]:
+        """BM25 scores for the ranked documents, keyed like the Q/K scores."""
+        text = str(query_text or "").strip()
+        if not text:
+            return {}
+        scores: dict[tuple[str, str], float] = {}
+        for lane, repository in self.repositories.items():
+            lexical = getattr(repository, "lexical_document_scores", None)
+            if not callable(lexical):
+                continue
+            for document_id, score in lexical(text).items():
+                key = (lane, document_id)
+                if key in documents and score > 0:
+                    scores[key] = float(score)
+        return scores
 
-        Long documents cannot be shown to the reference judge in full; the
-        salient spans are exactly the evidence the page will restore, so they
-        are the faithful bounded view for admission decisions.
+    @staticmethod
+    def _fused_rank(
+        relative_scores: dict[tuple[str, str], float],
+        lexical_scores: dict[tuple[str, str], float],
+    ) -> dict[tuple[str, str], int]:
+        """Reciprocal-rank fusion of the standardized Q/K and BM25 orders.
+
+        Documents without any lexical overlap contribute only their Q/K term,
+        so a lexical hit lifts a document but never demotes one below where
+        Q/K alone would place it relative to other non-matching documents.
+        """
+        if not lexical_scores:
+            return {}
+        qk_order = sorted(
+            relative_scores, key=lambda key: (-relative_scores[key], key)
+        )
+        lexical_order = sorted(
+            lexical_scores, key=lambda key: (-lexical_scores[key], key)
+        )
+        fused = {
+            key: 1.0 / (_RRF_K + rank) for rank, key in enumerate(qk_order, start=1)
+        }
+        for rank, key in enumerate(lexical_order, start=1):
+            fused[key] = fused.get(key, 0.0) + 1.0 / (_RRF_K + rank)
+        order = sorted(fused, key=lambda key: (-fused[key], key))
+        return {key: rank for rank, key in enumerate(order, start=1)}
+
+    def _judge_excerpt(self, candidate: Any, page: TensorBankPage) -> str | None:
+        """Render title, rule-card head and salient spans for the judge.
+
+        Long documents cannot be shown to the reference judge in full. The
+        salient spans are the evidence Q/K selected, but on their own they are
+        a noisy slice; the title and the opening rule card identify what the
+        document is actually about, so they lead the excerpt.
         """
         if page.lane != "knowledge" or not page.salient_positions:
             return None
@@ -1601,8 +1694,18 @@ class TensorBank:
                 parts = [
                     self.tokenizer.decode(raw_ids[start:end]) for start, end in spans
                 ]
+                title = ""
+                repository = self.repositories.get(page.lane)
+                if repository is not None:
+                    try:
+                        title = str(repository.get(page.document_id).title or "")
+                    except KeyError:
+                        title = ""
+                head = self.tokenizer.decode(raw_ids[:_JUDGE_EXCERPT_HEAD_TOKENS])
                 excerpt = (
-                    f"# {page.relative_path}\n\n[显著片段摘录]\n"
+                    f"# {page.relative_path}\n"
+                    + (f"标题: {title}\n" if title else "")
+                    + f"\n[文档开头]\n{head}\n\n[显著片段摘录]\n"
                     + "\n[……]\n".join(parts)
                 )
         self._judge_excerpt_cache[cache_key] = excerpt

@@ -72,7 +72,9 @@ class FakeQKTensorBank:
         min_tensor_score=0.0,
         min_document_margin=0.005,
         audit=None,
+        query_text=None,
     ):
+        del query_text
         self.rank_calls.append(
             (query_heads, query_states, query_identity, limit, min_document_margin)
         )
@@ -158,7 +160,9 @@ class MarginGatedFakeQKTensorBank(FakeQKTensorBank):
         min_tensor_score=0.0,
         min_document_margin=0.005,
         audit=None,
+        query_text=None,
     ):
+        del query_text
         self.rank_calls.append(
             (query_heads, query_states, query_identity, limit, min_document_margin)
         )

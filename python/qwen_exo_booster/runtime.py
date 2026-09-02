@@ -6475,6 +6475,7 @@ class QwenExoRuntime:
             min_document_margin=0.0,
             audit=rank_audit,
             eligible_documents=eligible_documents,
+            query_text=query,
         )
         by_id = {document.document_id: document for document in documents}
         candidates = tuple(

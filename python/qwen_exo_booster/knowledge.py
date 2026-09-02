@@ -540,24 +540,22 @@ class KnowledgeRepository:
             normalized_reference_content=document.normalized_content,
         )
 
-    def rank(self, query: str, limit: int = 8) -> tuple[KnowledgeCandidate, ...]:
+    def lexical_document_scores(self, query: str) -> dict[str, float]:
+        """Return BM25 scores by document id for documents sharing a query term."""
         query_counts = Counter(lexical_terms(query))
-        if not query_counts or limit < 1:
-            return ()
-
+        if not query_counts:
+            return {}
         with self._lock:
             snapshot = self._snapshot
             term_counts = self._term_counts
             document_frequency = self._document_frequency
             average_length = self._average_document_length
-
         document_count = len(snapshot.documents)
         if document_count == 0:
-            return ()
-
-        candidates = []
+            return {}
         k1 = 1.5
         b = 0.75
+        scores: dict[str, float] = {}
         for document in snapshot.documents:
             counts = term_counts[document.document_id]
             document_length = sum(counts.values())
@@ -583,6 +581,21 @@ class KnowledgeRepository:
                     / denominator
                     * min(query_frequency, 3)
                 )
+            if lexical_score > 0:
+                scores[document.document_id] = lexical_score
+        return scores
+
+    def rank(self, query: str, limit: int = 8) -> tuple[KnowledgeCandidate, ...]:
+        if limit < 1:
+            return ()
+        lexical_scores = self.lexical_document_scores(query)
+        if not lexical_scores:
+            return ()
+        snapshot = self.snapshot
+
+        candidates = []
+        for document in snapshot.documents:
+            lexical_score = lexical_scores.get(document.document_id, 0.0)
             if lexical_score <= 0:
                 continue
             quality_prior = document.quality * 0.1 + (

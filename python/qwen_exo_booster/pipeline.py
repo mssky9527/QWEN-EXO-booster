@@ -345,6 +345,7 @@ class MemoryPipeline:
         query_states: tuple[QueryStateSpan, ...],
         query_identity: str,
         *,
+        query_text: str | None = None,
         limit_override: int | None = None,
     ) -> tuple[tuple[KnowledgeCandidate, ...], dict[str, Any]]:
         initial_limit = max(
@@ -395,6 +396,7 @@ class MemoryPipeline:
                 min_tensor_score=min_tensor_score,
                 min_document_margin=rank_margin,
                 audit=initial_audit,
+                query_text=query_text,
             )
         )
         final_audit = initial_audit
@@ -423,6 +425,7 @@ class MemoryPipeline:
                         min_tensor_score=min_tensor_score,
                         min_document_margin=rank_margin,
                         audit=expanded_audit,
+                        query_text=query_text,
                     )
                 )
                 final_audit = expanded_audit
@@ -1110,6 +1113,7 @@ class MemoryPipeline:
                 query_heads,
                 query_states,
                 f"request-query-probe:{retrieval_question_digest}",
+                query_text=question,
             )
             qk_ranked_candidates = tuple(ranked)
             candidates.extend(ranked)
@@ -1301,6 +1305,7 @@ class MemoryPipeline:
                     query_heads,
                     query_states,
                     f"request-query-probe:{retrieval_question_digest}",
+                    query_text=question,
                     limit_override=expanded_limit,
                 )
                 existing_qk_keys = {

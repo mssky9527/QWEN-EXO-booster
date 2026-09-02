@@ -1221,6 +1221,7 @@ class SelfAskRefreshService:
             limit=self.max_candidates,
             min_tensor_score=self.qk_min_tensor_score,
             min_document_margin=self.qk_admission_margin,
+            query_text=user_question,
         )
         return candidates
 
